@@ -17,6 +17,51 @@ Only the current leader sends final results to `S3`.
 
 ---
 
+## Architecture
+
+```mermaid
+flowchart LR
+    subgraph S1["order-sending (S1)"]
+        Sender["Order generator\nbind :9001"]
+    end
+
+    subgraph S2["order-process cluster (S2)"]
+        direction TB
+        N1["Node 1\nraft :6001\norders :7001\nWAL"]
+        N2["Node 2\nraft :6002\norders :7002\nWAL"]
+        N3["Node 3\nraft :6003\norders :7003\nWAL"]
+        N1 <-->|"Raft UDP\nAppendEntries / AppendAck"| N2
+        N2 <-->|"Raft UDP"| N3
+        N3 <-->|"Raft UDP"| N1
+    end
+
+    subgraph S3["order-receiver (S3)"]
+        Receiver["Result printer\nbind :8001"]
+    end
+
+    Sender -->|"UDP fan-out\nevery order"| N1
+    Sender -->|"UDP"| N2
+    Sender -->|"UDP"| N3
+
+    N1 -.->|"only leader"| Receiver
+    N2 -.->|"follower: no external emit"| Receiver
+    N3 -.->|"follower: no external emit"| Receiver
+```
+
+**Roles**
+
+| Service | Machines (example) | Responsibility |
+|---|---|---|
+| `order-sending` | Yousuf | Creates orders every 1s; sends to all S2 order ports |
+| `order-process` | Vivek, Amit, Nitin | Leader election, replicated WAL, quorum commit, apply |
+| `order-receiver` | Yousuf | Prints final committed results from the leader |
+
+**Leader path:** S1 → all S2 order ports → leader proposes to WAL → replicate to followers → quorum commit → leader sends result to S3.
+
+**Failover:** If the leader stops, remaining nodes elect a new leader (higher term); the new leader continues sending to S3.
+
+---
+
 ## Project Structure
 
 Each service is fully independent (own `Cargo.toml`, own `target`):
@@ -66,36 +111,34 @@ Follower nodes do not emit external results.
 
 ## Config (.env)
 
-`order-process` loads cluster IPs/ports from `order-process/.env`.
+`order-process` loads cluster IPs/ports from `order-process/.env` (via `dotenvy` and `starter.sh`).
+
+| File | Use case |
+|---|---|
+| `.env.example` | **One computer** — all nodes on `127.0.0.1` (local dev) |
+| `cluster.sample` | **Multi-machine** — real IPs for Vivek / Amit / Nitin / Yousuf |
+| `.env` | Active config on each machine (copy from example or sample) |
+
+**Local single-machine setup**
+
+```bash
+cd order-process
+cp .env.example .env
+```
+
+**Multi-machine cluster**
 
 ```bash
 cd order-process
 cp cluster.sample .env
-# edit NODE1_HOST / NODE2_HOST / NODE3_HOST / ports / S3_HOST
+# edit IPs if needed
 ```
 
-Example multi-machine values:
-
-```env
-BIND_HOST=0.0.0.0
-NODE1_HOST=172.16.12.104
-NODE1_RAFT_PORT=6001
-NODE1_ORDER_PORT=7001
-NODE2_HOST=172.16.13.181
-NODE2_RAFT_PORT=6002
-NODE2_ORDER_PORT=7002
-NODE3_HOST=10.10.1.121
-NODE3_RAFT_PORT=6003
-NODE3_ORDER_PORT=7003
-S3_HOST=10.10.1.69
-S3_PORT=8001
-```
-
-Use the **same `.env` content** on all three `order-process` machines. Set only `NODE_ID` differently when starting.
+Use the **same `.env` content** on all three `order-process` machines. Set only `NODE_ID` differently when starting (`./starter.sh 1` / `2` / `3`).
 
 ---
 
-Default cluster IPs (see `order-process/.env`):
+Default cluster IPs (see `order-process/cluster.sample` or `.env`):
 
 | Machine | Role | IP |
 |---|---|---|
