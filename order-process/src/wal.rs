@@ -35,12 +35,14 @@ impl Wal {
         fs::create_dir_all(&base_dir)?;
         let path = base_dir.join(format!("wal-s2-{}.log", node_id));
         let entries = Self::load_entries(&path)?;
-        println!(
-            "[wal] opened {} ({} entries, last_index={})",
-            path.display(),
-            entries.len(),
-            entries.last().map(|e| e.index).unwrap_or(0)
-        );
+        if crate::config::verbose_raft() {
+            println!(
+                "[wal] opened {} ({} entries, last_index={})",
+                path.display(),
+                entries.len(),
+                entries.last().map(|e| e.index).unwrap_or(0)
+            );
+        }
         Ok(Self { path, entries })
     }
 

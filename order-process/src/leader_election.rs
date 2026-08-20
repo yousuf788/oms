@@ -1,6 +1,6 @@
 use crate::config::{
-    election_timeout_max_ms, election_timeout_min_ms, find_node, heartbeat_interval_ms, s2_nodes,
-    S2Node,
+    election_timeout_max_ms, election_timeout_min_ms, find_node, format_role_summary,
+    heartbeat_interval_ms, node_name, s2_nodes, verbose_raft, S2Node,
 };
 use crate::wal::{LogEntry, ReplicatedCommand, Wal};
 use rand::Rng;
@@ -116,8 +116,8 @@ impl LeaderElection {
         });
 
         println!(
-            "[S2-{}] control channel bound on {}",
-            self_id, self_node.raft_port
+            "[role] {} started as FOLLOWER (waiting for leader)",
+            node_name(self_id)
         );
 
         let recv_handle = Arc::clone(&election);
@@ -133,8 +133,16 @@ impl LeaderElection {
         self.is_leader_flag.load(Ordering::Relaxed)
     }
 
+    pub fn current_leader_id(&self) -> Option<u8> {
+        self.state.lock().unwrap().leader_id
+    }
+
     pub fn current_term(&self) -> u64 {
         self.state.lock().unwrap().term
+    }
+
+    fn print_roles(&self, leader_id: Option<u8>) {
+        println!("[role] {}", format_role_summary(leader_id));
     }
 
     pub fn propose_command(&self, command: ReplicatedCommand) -> Option<ReplicatedCommand> {
@@ -219,7 +227,7 @@ impl LeaderElection {
                 Vec::new()
             };
 
-            if !entries.is_empty() {
+            if !entries.is_empty() && verbose_raft() {
                 println!(
                     "[S2-{}] replicate -> S2-{} next_index={} batch={} leader_last={}",
                     self.self_id,
@@ -294,10 +302,12 @@ impl LeaderElection {
                 wal.entry_at(next_to_apply)
             };
             if let Some(applied) = entry {
-                println!(
-                    "[S2-{}] applied index={} term={} order_id={}",
-                    self.self_id, applied.index, applied.term, applied.command.order_id
-                );
+                if verbose_raft() {
+                    println!(
+                        "[S2-{}] applied index={} term={} order_id={}",
+                        self.self_id, applied.index, applied.term, applied.command.order_id
+                    );
+                }
                 let mut st = self.state.lock().unwrap();
                 if st.last_applied < applied.index {
                     st.last_applied = applied.index;
@@ -331,10 +341,12 @@ impl LeaderElection {
                             st.leader_id = None;
                             st.last_heartbeat = Instant::now();
                             st.election_timeout = random_timeout();
-                            println!(
-                                "[S2-{}] [term {}] election timeout — starting election",
-                                self.self_id, st.term
-                            );
+                            if verbose_raft() {
+                                println!(
+                                    "[S2-{}] [term {}] election timeout — starting election",
+                                    self.self_id, st.term
+                                );
+                            }
                             Action::StartElection(st.term)
                         } else {
                             Action::None
@@ -381,10 +393,12 @@ impl LeaderElection {
             let msg: Message = match serde_json::from_slice(&buf[..n]) {
                 Ok(m) => m,
                 Err(err) => {
-                    eprintln!(
-                        "[S2-{}] dropped raft packet ({} bytes): {err}",
-                        self.self_id, n
-                    );
+                    if verbose_raft() {
+                        eprintln!(
+                            "[S2-{}] dropped raft packet ({} bytes): {err}",
+                            self.self_id, n
+                        );
+                    }
                     continue;
                 }
             };
@@ -415,10 +429,9 @@ impl LeaderElection {
             st.election_timeout = random_timeout();
             if was_leader {
                 self.is_leader_flag.store(false, Ordering::Relaxed);
-                println!(
-                    "[S2-{}] [term {}] stepping down, saw higher term",
-                    self.self_id, incoming_term
-                );
+                drop(st);
+                self.print_roles(None);
+                st = self.state.lock().unwrap();
             }
         }
 
@@ -446,15 +459,17 @@ impl LeaderElection {
                     st.election_timeout = random_timeout();
                     drop(st);
                     if let Some(candidate) = find_node(candidate_id) {
-                        println!(
-                            "[S2-{}] granted vote to S2-{} (candidate log {}/{} vs local {}/{})",
-                            self.self_id,
-                            candidate_id,
-                            last_log_index,
-                            last_log_term,
-                            my_last_index,
-                            my_last_term
-                        );
+                        if verbose_raft() {
+                            println!(
+                                "[S2-{}] granted vote to S2-{} (candidate log {}/{} vs local {}/{})",
+                                self.self_id,
+                                candidate_id,
+                                last_log_index,
+                                last_log_term,
+                                my_last_index,
+                                my_last_term
+                            );
+                        }
                         self.send(
                             &candidate,
                             &Message::VoteGranted {
@@ -463,7 +478,7 @@ impl LeaderElection {
                             },
                         );
                     }
-                } else if !log_ok {
+                } else if !log_ok && verbose_raft() {
                     println!(
                         "[S2-{}] denied vote to S2-{} — stale log (candidate {}/{} vs local {}/{})",
                         self.self_id,
@@ -493,10 +508,8 @@ impl LeaderElection {
                         st.match_index.clear();
                         st.match_index.insert(self.self_id, next_idx.saturating_sub(1));
                         self.is_leader_flag.store(true, Ordering::Relaxed);
-                        println!(
-                            "[S2-{}] [term {}] won election — becoming leader",
-                            self.self_id, term
-                        );
+                        drop(st);
+                        self.print_roles(Some(self.self_id));
                     }
                 }
             }
@@ -512,6 +525,7 @@ impl LeaderElection {
                     return; // stale leader, ignore
                 }
                 let was_leader = st.role == Role::Leader;
+                let prev_leader = st.leader_id;
                 st.leader_id = Some(leader_id);
                 st.last_heartbeat = Instant::now();
                 st.term = term;
@@ -521,7 +535,11 @@ impl LeaderElection {
                 if was_leader {
                     self.is_leader_flag.store(false, Ordering::Relaxed);
                 }
+                let announce = was_leader || prev_leader != Some(leader_id);
                 drop(st);
+                if announce {
+                    self.print_roles(Some(leader_id));
+                }
 
                 let append_result = {
                     let mut wal = self.wal.lock().unwrap();
@@ -567,7 +585,7 @@ impl LeaderElection {
                     let prev_match = st.match_index.get(&follower_id).copied().unwrap_or(0);
                     st.match_index.insert(follower_id, match_index);
                     st.next_index.insert(follower_id, match_index + 1);
-                    if match_index > prev_match {
+                    if match_index > prev_match && verbose_raft() {
                         println!(
                             "[S2-{}] follower S2-{} matched through index {}",
                             self.self_id, follower_id, match_index
@@ -580,10 +598,12 @@ impl LeaderElection {
                     let hinted = match_index.saturating_add(1).max(1);
                     let current = st.next_index.get(&follower_id).copied().unwrap_or(hinted);
                     let next = hinted.min(current.saturating_sub(1)).max(1);
-                    println!(
-                        "[S2-{}] follower S2-{} reject (follower_last={}) next_index {} -> {}",
-                        self.self_id, follower_id, match_index, current, next
-                    );
+                    if verbose_raft() {
+                        println!(
+                            "[S2-{}] follower S2-{} reject (follower_last={}) next_index {} -> {}",
+                            self.self_id, follower_id, match_index, current, next
+                        );
+                    }
                     st.next_index.insert(follower_id, next);
                 }
             }

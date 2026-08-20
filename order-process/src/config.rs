@@ -4,6 +4,7 @@ use std::sync::OnceLock;
 #[derive(Clone, Debug)]
 pub struct S2Node {
     pub id: u8,
+    pub name: String,
     pub host: String,
     pub raft_port: u16,
     pub order_port: u16,
@@ -18,6 +19,7 @@ pub struct ClusterConfig {
     pub heartbeat_interval_ms: u64,
     pub election_timeout_min_ms: u64,
     pub election_timeout_max_ms: u64,
+    pub verbose_raft: bool,
 }
 
 static CONFIG: OnceLock<ClusterConfig> = OnceLock::new();
@@ -46,6 +48,13 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
+fn env_bool(key: &str, default: bool) -> bool {
+    match env::var(key) {
+        Ok(v) => matches!(v.to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Err(_) => default,
+    }
+}
+
 fn load_from_env() -> ClusterConfig {
     let _ = dotenvy::dotenv();
 
@@ -53,18 +62,21 @@ fn load_from_env() -> ClusterConfig {
         nodes: vec![
             S2Node {
                 id: 1,
+                name: env_or("NODE1_NAME", "Vivek"),
                 host: env_required("NODE1_HOST"),
                 raft_port: env_u16("NODE1_RAFT_PORT", 6001),
                 order_port: env_u16("NODE1_ORDER_PORT", 7001),
             },
             S2Node {
                 id: 2,
+                name: env_or("NODE2_NAME", "Amit"),
                 host: env_required("NODE2_HOST"),
                 raft_port: env_u16("NODE2_RAFT_PORT", 6002),
                 order_port: env_u16("NODE2_ORDER_PORT", 7002),
             },
             S2Node {
                 id: 3,
+                name: env_or("NODE3_NAME", "Yousuf"),
                 host: env_required("NODE3_HOST"),
                 raft_port: env_u16("NODE3_RAFT_PORT", 6003),
                 order_port: env_u16("NODE3_ORDER_PORT", 7003),
@@ -76,6 +88,7 @@ fn load_from_env() -> ClusterConfig {
         heartbeat_interval_ms: env_u64("HEARTBEAT_INTERVAL_MS", 100),
         election_timeout_min_ms: env_u64("ELECTION_TIMEOUT_MIN_MS", 300),
         election_timeout_max_ms: env_u64("ELECTION_TIMEOUT_MAX_MS", 600),
+        verbose_raft: env_bool("VERBOSE_RAFT", false),
     }
 }
 
@@ -141,8 +154,35 @@ pub fn find_node(id: u8) -> Option<S2Node> {
     config().nodes.iter().find(|n| n.id == id).cloned()
 }
 
+pub fn node_name(id: u8) -> String {
+    find_node(id)
+        .map(|n| n.name)
+        .unwrap_or_else(|| format!("S2-{id}"))
+}
+
+/// e.g. "Vivek is LEADER; Amit is FOLLOWER; Yousuf is FOLLOWER"
+pub fn format_role_summary(leader_id: Option<u8>) -> String {
+    config()
+        .nodes
+        .iter()
+        .map(|n| {
+            let role = if Some(n.id) == leader_id {
+                "LEADER"
+            } else {
+                "FOLLOWER"
+            };
+            format!("{} is {}", n.name, role)
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 pub fn s2_nodes() -> &'static [S2Node] {
     &config().nodes
+}
+
+pub fn verbose_raft() -> bool {
+    config().verbose_raft
 }
 
 pub fn heartbeat_interval_ms() -> u64 {
