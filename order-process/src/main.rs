@@ -2,7 +2,7 @@
 // Multi-machine: same .env everywhere; NODE_ID is auto-detected from local IP.
 // Override: NODE_ID=1|2|3 ./starter.sh   (needed for all-localhost demos)
 
-use order_process::config::{find_node, format_role_summary, init_config, node_name, resolve_node_id};
+use order_process::config::{find_node, init_config, node_name, resolve_node_id};
 use order_process::leader_election::LeaderElection;
 use order_process::wal::ReplicatedCommand;
 use rand::Rng;
@@ -44,19 +44,14 @@ fn main() {
     let result_socket =
         UdpSocket::bind((cfg.bind_host.as_str(), 0)).expect("failed to bind result socket");
 
-    let mut last_announced_leader: Option<Option<u8>> = None;
+    let mut last_role_line = String::new();
     let mut buf = [0u8; 4096];
 
     loop {
-        // Also refresh role line if leader_id changed without an order arriving.
-        let leader_now = if election.is_leader() {
-            Some(node_id)
-        } else {
-            election.current_leader_id()
-        };
-        if last_announced_leader != Some(leader_now) {
-            println!("[role] {}", format_role_summary(leader_now));
-            last_announced_leader = Some(leader_now);
+        let line = election.role_summary();
+        if line != last_role_line {
+            println!("[role] {line}");
+            last_role_line = line;
         }
 
         order_socket

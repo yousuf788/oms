@@ -1,6 +1,7 @@
 use crate::config::{
-    election_timeout_max_ms, election_timeout_min_ms, find_node, format_role_summary,
-    heartbeat_interval_ms, node_name, s2_nodes, verbose_raft, S2Node,
+    allow_single_node_leader, election_timeout_max_ms, election_timeout_min_ms, find_node,
+    format_role_summary, heartbeat_interval_ms, node_name, peer_silent_ms, s2_nodes, verbose_raft,
+    S2Node,
 };
 use crate::wal::{LogEntry, ReplicatedCommand, Wal};
 use rand::Rng;
@@ -61,6 +62,12 @@ struct RaftState {
     last_applied: u64,
     last_heartbeat: Instant,
     election_timeout: Duration,
+    /// Last time any raft message arrived from another node.
+    last_peer_contact: Instant,
+    /// Per-peer last raft contact (for availability lines).
+    peer_last_contact: HashMap<u8, Instant>,
+    /// true = available; used to print only on change.
+    peer_available: HashMap<u8, bool>,
 }
 
 fn random_timeout() -> Duration {
@@ -88,6 +95,9 @@ impl LeaderElection {
             .filter(|n| n.id != self_id)
             .cloned()
             .collect();
+        let peer_last_contact: HashMap<u8, Instant> =
+            peers.iter().map(|p| (p.id, Instant::now())).collect();
+        let peer_available: HashMap<u8, bool> = peers.iter().map(|p| (p.id, true)).collect();
 
         let bind_host = crate::config::config().bind_host.as_str();
         let socket = UdpSocket::bind((bind_host, self_node.raft_port))
@@ -110,6 +120,9 @@ impl LeaderElection {
                 last_applied: 0,
                 last_heartbeat: Instant::now(),
                 election_timeout: random_timeout(),
+                last_peer_contact: Instant::now(),
+                peer_last_contact,
+                peer_available,
             }),
             wal: Mutex::new(wal),
             is_leader_flag: AtomicBool::new(false),
@@ -141,8 +154,40 @@ impl LeaderElection {
         self.state.lock().unwrap().term
     }
 
+    /// Role line including "not available" for silent peers.
+    pub fn role_summary(&self) -> String {
+        let st = self.state.lock().unwrap();
+        let leader_id = if st.role == Role::Leader {
+            Some(self.self_id)
+        } else {
+            st.leader_id
+        };
+        format_role_summary(leader_id, &self.unavailable_peer_ids(&st))
+    }
+
+    fn unavailable_peer_ids(&self, st: &RaftState) -> Vec<u8> {
+        let silent = Duration::from_millis(peer_silent_ms());
+        self.peers
+            .iter()
+            .filter(|p| {
+                let last = st
+                    .peer_last_contact
+                    .get(&p.id)
+                    .copied()
+                    .unwrap_or_else(Instant::now);
+                last.elapsed() >= silent
+                    || !st.peer_available.get(&p.id).copied().unwrap_or(true)
+            })
+            .map(|p| p.id)
+            .collect()
+    }
+
     fn print_roles(&self, leader_id: Option<u8>) {
-        println!("[role] {}", format_role_summary(leader_id));
+        let st = self.state.lock().unwrap();
+        println!(
+            "[role] {}",
+            format_role_summary(leader_id, &self.unavailable_peer_ids(&st))
+        );
     }
 
     pub fn propose_command(&self, command: ReplicatedCommand) -> Option<ReplicatedCommand> {
@@ -193,8 +238,87 @@ impl LeaderElection {
         }
     }
 
-    fn quorum(&self) -> usize {
-        (self.peers.len() + 1) / 2 + 1 // 2 of 3
+    fn mark_peer_contact(&self, st: &mut RaftState, peer_id: u8) {
+        if peer_id == self.self_id {
+            return;
+        }
+        st.last_peer_contact = Instant::now();
+        st.peer_last_contact.insert(peer_id, Instant::now());
+        st.peer_available.insert(peer_id, true);
+    }
+
+    fn refresh_peer_availability(&self) {
+        let silent = Duration::from_millis(peer_silent_ms());
+        let mut st = self.state.lock().unwrap();
+        let peer_ids: Vec<u8> = self.peers.iter().map(|p| p.id).collect();
+        let mut changed = false;
+        for peer_id in peer_ids {
+            let last = st
+                .peer_last_contact
+                .get(&peer_id)
+                .copied()
+                .unwrap_or_else(Instant::now);
+            let available = last.elapsed() < silent;
+            let was = st.peer_available.get(&peer_id).copied().unwrap_or(true);
+            if was != available {
+                st.peer_available.insert(peer_id, available);
+                changed = true;
+            }
+        }
+        if changed {
+            let leader_id = if st.role == Role::Leader {
+                Some(self.self_id)
+            } else {
+                st.leader_id
+            };
+            let line = format_role_summary(leader_id, &self.unavailable_peer_ids(&st));
+            drop(st);
+            println!("[role] {line}");
+        }
+    }
+
+    fn peers_unreachable(&self, st: &RaftState) -> bool {
+        allow_single_node_leader()
+            && st.last_peer_contact.elapsed() >= Duration::from_millis(peer_silent_ms())
+    }
+
+    /// Majority of configured cluster, or 1 when peers have been silent (lab failover).
+    fn quorum_for(&self, st: &RaftState) -> usize {
+        let majority = (self.peers.len() + 1) / 2 + 1;
+        if self.peers_unreachable(st) {
+            1
+        } else {
+            majority
+        }
+    }
+
+    fn become_leader_locked(&self, st: &mut RaftState) {
+        st.role = Role::Leader;
+        st.leader_id = Some(self.self_id);
+        let next_idx = {
+            let wal = self.wal.lock().unwrap();
+            wal.last_index() + 1
+        };
+        st.next_index = self
+            .peers
+            .iter()
+            .map(|peer| (peer.id, next_idx))
+            .collect::<HashMap<_, _>>();
+        st.match_index.clear();
+        st.match_index.insert(self.self_id, next_idx.saturating_sub(1));
+        st.last_heartbeat = Instant::now();
+        self.is_leader_flag.store(true, Ordering::Relaxed);
+        let single = self.peers_unreachable(st);
+        if single {
+            println!(
+                "[role] {} is LEADER (single-node: other machines unreachable)",
+                node_name(self.self_id)
+            );
+        }
+        println!(
+            "[role] {}",
+            format_role_summary(Some(self.self_id), &self.unavailable_peer_ids(st))
+        );
     }
 
     fn replicate_to_peers(&self) {
@@ -253,9 +377,9 @@ impl LeaderElection {
     }
 
     fn try_advance_commit(&self) {
-        let (current_term, current_commit) = {
+        let (current_term, current_commit, needed) = {
             let st = self.state.lock().unwrap();
-            (st.term, st.commit_index)
+            (st.term, st.commit_index, self.quorum_for(&st))
         };
         let wal = self.wal.lock().unwrap();
         let last_index = wal.last_index();
@@ -272,7 +396,7 @@ impl LeaderElection {
             }
             drop(st);
 
-            if replicated >= self.quorum() {
+            if replicated >= needed {
                 let wal = self.wal.lock().unwrap();
                 if wal.get_term_at(idx) == Some(current_term) {
                     highest = idx;
@@ -321,18 +445,50 @@ impl LeaderElection {
     fn tick_loop(&self) {
         loop {
             thread::sleep(Duration::from_millis(50));
+            self.refresh_peer_availability();
 
             enum Action {
                 None,
                 Replicate,
                 StartElection(u64),
+                BecameLeader,
             }
 
             let action = {
                 let mut st = self.state.lock().unwrap();
                 match st.role {
                     Role::Leader => Action::Replicate,
-                    _ => {
+                    Role::Candidate => {
+                        if st.last_heartbeat.elapsed() >= st.election_timeout {
+                            let needed = self.quorum_for(&st);
+                            if st.votes.len() >= needed {
+                                self.become_leader_locked(&mut st);
+                                Action::BecameLeader
+                            } else if self.peers_unreachable(&st) {
+                                // Peers down long enough → win with self vote only.
+                                self.become_leader_locked(&mut st);
+                                Action::BecameLeader
+                            } else {
+                                // Restart election (peers alive but not enough votes yet).
+                                st.term += 1;
+                                st.voted_for = Some(self.self_id);
+                                st.votes = HashSet::from([self.self_id]);
+                                st.leader_id = None;
+                                st.last_heartbeat = Instant::now();
+                                st.election_timeout = random_timeout();
+                                if verbose_raft() {
+                                    println!(
+                                        "[S2-{}] [term {}] election retry",
+                                        self.self_id, st.term
+                                    );
+                                }
+                                Action::StartElection(st.term)
+                            }
+                        } else {
+                            Action::None
+                        }
+                    }
+                    Role::Follower => {
                         if st.last_heartbeat.elapsed() >= st.election_timeout {
                             st.term += 1;
                             st.role = Role::Candidate;
@@ -368,11 +524,15 @@ impl LeaderElection {
                         last_log_index,
                         last_log_term,
                     });
+                    // If already alone, next candidate timeout will promote to leader.
+                }
+                Action::BecameLeader => {
+                    self.replicate_to_peers();
+                    self.try_advance_commit();
                 }
                 Action::None => {}
             }
 
-            // keep the heartbeat cadence roughly separate from the 50ms poll
             if self.is_leader() {
                 thread::sleep(Duration::from_millis(
                     heartbeat_interval_ms().saturating_sub(50),
@@ -408,6 +568,16 @@ impl LeaderElection {
 
     fn handle_message(&self, msg: Message) {
         let mut st = self.state.lock().unwrap();
+
+        let peer_from_msg = match &msg {
+            Message::RequestVote { candidate_id, .. } => Some(*candidate_id),
+            Message::VoteGranted { voter_id, .. } => Some(*voter_id),
+            Message::AppendEntries { leader_id, .. } => Some(*leader_id),
+            Message::AppendAck { follower_id, .. } => Some(*follower_id),
+        };
+        if let Some(peer_id) = peer_from_msg {
+            self.mark_peer_contact(&mut st, peer_id);
+        }
 
         let incoming_term = match &msg {
             Message::RequestVote { term, .. } => *term,
@@ -493,23 +663,11 @@ impl LeaderElection {
             Message::VoteGranted { term, voter_id } => {
                 if st.role == Role::Candidate && term == st.term {
                     st.votes.insert(voter_id);
-                    if st.votes.len() >= self.quorum() {
-                        st.role = Role::Leader;
-                        st.leader_id = Some(self.self_id);
-                        let next_idx = {
-                            let wal = self.wal.lock().unwrap();
-                            wal.last_index() + 1
-                        };
-                        st.next_index = self
-                            .peers
-                            .iter()
-                            .map(|peer| (peer.id, next_idx))
-                            .collect::<HashMap<_, _>>();
-                        st.match_index.clear();
-                        st.match_index.insert(self.self_id, next_idx.saturating_sub(1));
-                        self.is_leader_flag.store(true, Ordering::Relaxed);
+                    if st.votes.len() >= self.quorum_for(&st) {
+                        self.become_leader_locked(&mut st);
                         drop(st);
-                        self.print_roles(Some(self.self_id));
+                        self.replicate_to_peers();
+                        self.try_advance_commit();
                     }
                 }
             }

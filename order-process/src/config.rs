@@ -20,6 +20,9 @@ pub struct ClusterConfig {
     pub election_timeout_min_ms: u64,
     pub election_timeout_max_ms: u64,
     pub verbose_raft: bool,
+    /// When peers are silent, allow this node to win with only its own vote (lab failover).
+    pub allow_single_node_leader: bool,
+    pub peer_silent_ms: u64,
 }
 
 static CONFIG: OnceLock<ClusterConfig> = OnceLock::new();
@@ -89,6 +92,8 @@ fn load_from_env() -> ClusterConfig {
         election_timeout_min_ms: env_u64("ELECTION_TIMEOUT_MIN_MS", 300),
         election_timeout_max_ms: env_u64("ELECTION_TIMEOUT_MAX_MS", 600),
         verbose_raft: env_bool("VERBOSE_RAFT", false),
+        allow_single_node_leader: env_bool("ALLOW_SINGLE_NODE_LEADER", true),
+        peer_silent_ms: env_u64("PEER_SILENT_MS", 2000),
     }
 }
 
@@ -160,18 +165,20 @@ pub fn node_name(id: u8) -> String {
         .unwrap_or_else(|| format!("S2-{id}"))
 }
 
-/// e.g. "Vivek is LEADER; Amit is FOLLOWER; Yousuf is FOLLOWER"
-pub fn format_role_summary(leader_id: Option<u8>) -> String {
+/// e.g. "Vivek is not available; Amit is not available; Yousuf is LEADER"
+pub fn format_role_summary(leader_id: Option<u8>, unavailable: &[u8]) -> String {
     config()
         .nodes
         .iter()
         .map(|n| {
-            let role = if Some(n.id) == leader_id {
+            let status = if Some(n.id) == leader_id {
                 "LEADER"
+            } else if unavailable.contains(&n.id) {
+                "not available"
             } else {
                 "FOLLOWER"
             };
-            format!("{} is {}", n.name, role)
+            format!("{} is {}", n.name, status)
         })
         .collect::<Vec<_>>()
         .join("; ")
@@ -183,6 +190,14 @@ pub fn s2_nodes() -> &'static [S2Node] {
 
 pub fn verbose_raft() -> bool {
     config().verbose_raft
+}
+
+pub fn allow_single_node_leader() -> bool {
+    config().allow_single_node_leader
+}
+
+pub fn peer_silent_ms() -> u64 {
+    config().peer_silent_ms
 }
 
 pub fn heartbeat_interval_ms() -> u64 {

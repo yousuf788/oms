@@ -28,3 +28,7 @@ S3_PORT=8001
 HEARTBEAT_INTERVAL_MS=100
 ELECTION_TIMEOUT_MIN_MS=300
 ELECTION_TIMEOUT_MAX_MS=600
+
+# Lab failover: remaining node becomes leader if peers silent this long (ms)
+ALLOW_SINGLE_NODE_LEADER=true
+PEER_SILENT_MS=2000
