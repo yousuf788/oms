@@ -22,6 +22,12 @@ pub struct ClusterConfig {
 
 static CONFIG: OnceLock<ClusterConfig> = OnceLock::new();
 
+fn env_required(key: &str) -> String {
+    env::var(key).unwrap_or_else(|_| {
+        panic!("missing {key} in environment / .env — copy from .env.example or cluster.sample")
+    })
+}
+
 fn env_or(key: &str, default: &str) -> String {
     env::var(key).unwrap_or_else(|_| default.to_string())
 }
@@ -47,25 +53,25 @@ fn load_from_env() -> ClusterConfig {
         nodes: vec![
             S2Node {
                 id: 1,
-                host: env_or("NODE1_HOST", "172.16.12.104"),
+                host: env_required("NODE1_HOST"),
                 raft_port: env_u16("NODE1_RAFT_PORT", 6001),
                 order_port: env_u16("NODE1_ORDER_PORT", 7001),
             },
             S2Node {
                 id: 2,
-                host: env_or("NODE2_HOST", "172.16.13.181"),
+                host: env_required("NODE2_HOST"),
                 raft_port: env_u16("NODE2_RAFT_PORT", 6002),
                 order_port: env_u16("NODE2_ORDER_PORT", 7002),
             },
             S2Node {
                 id: 3,
-                host: env_or("NODE3_HOST", "10.10.1.121"),
+                host: env_required("NODE3_HOST"),
                 raft_port: env_u16("NODE3_RAFT_PORT", 6003),
                 order_port: env_u16("NODE3_ORDER_PORT", 7003),
             },
         ],
         bind_host: env_or("BIND_HOST", "0.0.0.0"),
-        s3_host: env_or("S3_HOST", "10.10.1.69"),
+        s3_host: env_required("S3_HOST"),
         s3_port: env_u16("S3_PORT", 8001),
         heartbeat_interval_ms: env_u64("HEARTBEAT_INTERVAL_MS", 100),
         election_timeout_min_ms: env_u64("ELECTION_TIMEOUT_MIN_MS", 300),
@@ -82,13 +88,19 @@ pub fn config() -> &'static ClusterConfig {
 }
 
 fn local_ipv4_addrs() -> Vec<String> {
-    let mut ips = vec!["127.0.0.1".to_string()];
+    let mut ips = Vec::new();
     if let Ok(output) = std::process::Command::new("hostname").arg("-I").output() {
         for token in String::from_utf8_lossy(&output.stdout).split_whitespace() {
             if token.contains('.') && !token.contains(':') {
                 ips.push(token.to_string());
             }
         }
+    }
+    // Loopback for single-machine .env.example demos
+    if ips.is_empty() {
+        ips.push("127.0.0.1".to_string());
+    } else if !ips.iter().any(|ip| ip == "127.0.0.1") {
+        ips.push("127.0.0.1".to_string());
     }
     ips
 }

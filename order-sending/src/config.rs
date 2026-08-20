@@ -1,23 +1,61 @@
-#[derive(Clone, Copy, Debug)]
+use std::env;
+use std::sync::OnceLock;
+
+#[derive(Clone, Debug)]
 pub struct S2Node {
-    pub host: &'static str,
+    pub host: String,
     pub order_port: u16,
 }
 
-pub const S2_NODES: [S2Node; 3] = [
-    S2Node {
-        host: "172.16.12.104",
-        order_port: 7001,
-    },
-    S2Node {
-        host: "172.16.13.181",
-        order_port: 7002,
-    },
-    S2Node {
-        host: "10.10.1.121",
-        order_port: 7003,
-    },
-];
+#[derive(Clone, Debug)]
+pub struct SenderConfig {
+    pub bind_host: String,
+    pub bind_port: u16,
+    pub nodes: Vec<S2Node>,
+}
 
-pub const SENDER_BIND_HOST: &str = "0.0.0.0";
-pub const SENDER_BIND_PORT: u16 = 9001;
+static CONFIG: OnceLock<SenderConfig> = OnceLock::new();
+
+fn env_required(key: &str) -> String {
+    env::var(key).unwrap_or_else(|_| {
+        panic!("missing {key} in environment / .env — copy from .env.example")
+    })
+}
+
+fn env_or(key: &str, default: &str) -> String {
+    env::var(key).unwrap_or_else(|_| default.to_string())
+}
+
+fn env_u16(key: &str, default: u16) -> u16 {
+    env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+fn load_from_env() -> SenderConfig {
+    let _ = dotenvy::dotenv();
+
+    SenderConfig {
+        bind_host: env_or("BIND_HOST", "0.0.0.0"),
+        bind_port: env_u16("SENDER_BIND_PORT", 9001),
+        nodes: vec![
+            S2Node {
+                host: env_required("NODE1_HOST"),
+                order_port: env_u16("NODE1_ORDER_PORT", 7001),
+            },
+            S2Node {
+                host: env_required("NODE2_HOST"),
+                order_port: env_u16("NODE2_ORDER_PORT", 7002),
+            },
+            S2Node {
+                host: env_required("NODE3_HOST"),
+                order_port: env_u16("NODE3_ORDER_PORT", 7003),
+            },
+        ],
+    }
+}
+
+pub fn init_config() -> &'static SenderConfig {
+    CONFIG.get_or_init(load_from_env)
+}

@@ -1,12 +1,9 @@
 // order-sending (S1)
-// Deploy on Yousuf (or any machine that can reach all S2 order ports).
-//
-// Build: cargo build -p order-sending --release
-// Run:   ./target/release/order-sending
+// Loads NODE1/2/3_HOST and ports from `.env` (no hardcoded IPs).
 
 mod config;
 
-use config::{S2_NODES, SENDER_BIND_HOST, SENDER_BIND_PORT};
+use config::init_config;
 use rand::Rng;
 use serde_json::json;
 use std::net::UdpSocket;
@@ -14,14 +11,20 @@ use std::thread;
 use std::time::Duration;
 
 fn main() {
-    let socket = UdpSocket::bind((SENDER_BIND_HOST, SENDER_BIND_PORT))
+    let cfg = init_config();
+    let socket = UdpSocket::bind((cfg.bind_host.as_str(), cfg.bind_port))
         .expect("failed to bind sender socket");
     let mut order_id: u64 = 1;
     let symbols = ["BTC-USDT", "ETH-USDT", "SOL-USDT"];
 
     println!(
-        "[order-sending] bound on {}:{}, publishing to all S2 nodes every 1s...",
-        SENDER_BIND_HOST, SENDER_BIND_PORT
+        "[order-sending] bound on {}:{}, targets: {:?}",
+        cfg.bind_host,
+        cfg.bind_port,
+        cfg.nodes
+            .iter()
+            .map(|n| format!("{}:{}", n.host, n.order_port))
+            .collect::<Vec<_>>()
     );
 
     loop {
@@ -36,8 +39,8 @@ fn main() {
         order_id += 1;
 
         if let Ok(buf) = serde_json::to_vec(&order) {
-            for node in S2_NODES.iter() {
-                let _ = socket.send_to(&buf, (node.host, node.order_port));
+            for node in &cfg.nodes {
+                let _ = socket.send_to(&buf, (node.host.as_str(), node.order_port));
             }
         }
         println!("[order-sending] sent order {}", order);

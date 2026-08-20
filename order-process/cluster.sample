@@ -13,13 +13,13 @@ NODE2_HOST=172.16.13.181
 NODE2_RAFT_PORT=6002
 NODE2_ORDER_PORT=7002
 
-# ---- Node 3 (Nitin) ----
-NODE3_HOST=10.10.1.121
+# ---- Node 3 (Yousuf) ----
+NODE3_HOST=172.16.12.252
 NODE3_RAFT_PORT=6003
 NODE3_ORDER_PORT=7003
 
-# order-receiver on Yousuf (LAN; Wi-Fi: 172.16.12.252)
-S3_HOST=10.10.1.69
+# order-receiver on Yousuf (same host as node 3)
+S3_HOST=172.16.12.252
 S3_PORT=8001
 
 HEARTBEAT_INTERVAL_MS=100

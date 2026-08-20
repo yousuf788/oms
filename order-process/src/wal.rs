@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
-use std::fs;
-use std::io;
+use std::fs::{self, OpenOptions};
+use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
@@ -35,6 +35,12 @@ impl Wal {
         fs::create_dir_all(&base_dir)?;
         let path = base_dir.join(format!("wal-s2-{}.log", node_id));
         let entries = Self::load_entries(&path)?;
+        println!(
+            "[wal] opened {} ({} entries, last_index={})",
+            path.display(),
+            entries.len(),
+            entries.last().map(|e| e.index).unwrap_or(0)
+        );
         Ok(Self { path, entries })
     }
 
@@ -61,8 +67,22 @@ impl Wal {
             out.push_str(&line);
             out.push('\n');
         }
-        fs::write(&self.path, out)?;
+        let mut file = OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .open(&self.path)?;
+        file.write_all(out.as_bytes())?;
+        file.sync_all()?;
         Ok(())
+    }
+
+    pub fn path(&self) -> &PathBuf {
+        &self.path
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
     }
 
     pub fn last_index(&self) -> u64 {

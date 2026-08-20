@@ -53,7 +53,7 @@ flowchart LR
 | Service | Machines (example) | Responsibility |
 |---|---|---|
 | `order-sending` | Yousuf | Creates orders every 1s; sends to all S2 order ports |
-| `order-process` | Vivek, Amit, Nitin | Leader election, replicated WAL, quorum commit, apply |
+| `order-process` | Vivek, Amit, Yousuf | Leader election, replicated WAL, quorum commit, apply |
 | `order-receiver` | Yousuf | Prints final committed results from the leader |
 
 **Leader path:** S1 → all S2 order ports → leader proposes to WAL → replicate to followers → quorum commit → leader sends result to S3.
@@ -72,11 +72,11 @@ Each service is fully independent (own `Cargo.toml`, own `target`):
 | `order-process/` | S2 | 3-node replicated processing cluster |
 | `order-receiver/` | S3 | Receives committed final results |
 
-Service-specific configs:
+Service-specific configs (all IPs/hosts come from `.env`, not Rust source):
 
-- `order-sending/src/config.rs`
-- `order-process/src/config.rs`
-- `order-receiver/src/config.rs`
+- `order-sending/.env` (+ `.env.example` / `cluster.sample`)
+- `order-process/.env` (+ `.env.example` / `cluster.sample`)
+- `order-receiver/.env` (+ `.env.example`)
 
 ---
 
@@ -116,7 +116,7 @@ Follower nodes do not emit external results.
 | File | Use case |
 |---|---|
 | `.env.example` | **One computer** — all nodes on `127.0.0.1` (local dev) |
-| `cluster.sample` | **Multi-machine** — real IPs for Vivek / Amit / Nitin / Yousuf |
+| `cluster.sample` | **Multi-machine** — real IPs for Vivek / Amit / Yousuf |
 | `.env` | Active config on each machine (copy from example or sample) |
 
 **Local single-machine setup**
@@ -144,8 +144,7 @@ Default cluster IPs (see `order-process/cluster.sample` or `.env`):
 |---|---|---|
 | Vivek | S2 node 1 | `172.16.12.104` |
 | Amit | S2 node 2 | `172.16.13.181` |
-| Nitin | S2 node 3 | `10.10.1.121` |
-| Yousuf | order-receiver (S3) | `10.10.1.69` |
+| Yousuf | S2 node 3 + order-receiver (S3) | `172.16.12.252` |
 
 ### 1) Build each service
 
@@ -182,21 +181,22 @@ You should see:
 
 ## Multi-Machine Setup
 
-If running on Vivek/Amit/Nitin/Yousuf style deployment:
+If running on Vivek/Amit/Yousuf style deployment:
 
-1. Update IPs in:
-   - `order-process/src/config.rs`
-   - `order-sending/src/config.rs`
-   - `order-receiver/src/config.rs`
+1. Put the same `NODE*_HOST` values in:
+   - `order-process/.env`
+   - `order-sending/.env`
+   - `order-receiver/.env` (needs `S3_PORT` / `BIND_HOST`)
 2. Build on each machine (or copy binaries).
 3. Ensure firewall/network allows all required ports.
 4. Start:
-   - `order-process` on 3 machines with `NODE_ID=1/2/3`
+   - `order-process` on 3 machines with `./starter.sh`
    - `order-receiver` on receiver machine
    - `order-sending` on sender machine
 
 Important:
 
+- Do not hardcode machine IPs in Rust — only in `.env` / `cluster.sample`.
 - Do not use `127.0.0.1` for cross-machine nodes.
 - Do not use Docker bridge IPs (`172.17.x.x`, `172.18.x.x`, etc.).
 
@@ -204,15 +204,25 @@ Important:
 
 ## WAL / Persistence
 
-`order-process` stores per-node WAL under:
+`order-process` stores **one WAL file per machine** (not a shared network file):
 
 - default: `order-process/data/wal-s2-<node_id>.log`
 - override: set `ORDER_PROCESS_DATA_DIR` env var
 
+Raft replication keeps those files logically identical: the leader batches `AppendEntries` to followers until every node has the same log indices.
+
+If WALs already diverged badly (e.g. one node has 20 lines and another has 1500):
+
+1. Stop sender and all `order-process` nodes.
+2. Keep the machine with the **longest correct** WAL (usually the old leader).
+3. On lagging nodes only: `rm -f order-process/data/wal-s2-*.log`
+4. Pull latest code, restart all three `./starter.sh`, then start sender.
+5. Watch logs for `replicate ->` / `matched through index` until lagging nodes catch up.
+
 Example:
 
 ```bash
-ORDER_PROCESS_DATA_DIR=/var/lib/order-process NODE_ID=1 ./target/release/order-process
+ORDER_PROCESS_DATA_DIR=/var/lib/order-process ./starter.sh
 ```
 
 ---

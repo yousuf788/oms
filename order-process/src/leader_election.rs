@@ -12,6 +12,10 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
+/// Keep AppendEntries UDP packets small so catch-up never exceeds MTU/recv buffer.
+const MAX_ENTRIES_PER_APPEND: usize = 32;
+const RECV_BUF_SIZE: usize = 65_535;
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Role {
     Follower,
@@ -22,7 +26,12 @@ pub enum Role {
 #[derive(Serialize, Deserialize, Debug)]
 #[serde(tag = "type")]
 enum Message {
-    RequestVote { term: u64, candidate_id: u8 },
+    RequestVote {
+        term: u64,
+        candidate_id: u8,
+        last_log_index: u64,
+        last_log_term: u64,
+    },
     VoteGranted { term: u64, voter_id: u8 },
     AppendEntries {
         term: u64,
@@ -203,9 +212,23 @@ impl LeaderElection {
             let prev_log_term = wal.get_term_at(prev_log_index).unwrap_or(0);
             let entries = if next_idx <= leader_last {
                 wal.entries_from(next_idx)
+                    .into_iter()
+                    .take(MAX_ENTRIES_PER_APPEND)
+                    .collect()
             } else {
                 Vec::new()
             };
+
+            if !entries.is_empty() {
+                println!(
+                    "[S2-{}] replicate -> S2-{} next_index={} batch={} leader_last={}",
+                    self.self_id,
+                    peer.id,
+                    next_idx,
+                    entries.len(),
+                    leader_last
+                );
+            }
 
             self.send(
                 peer,
@@ -322,10 +345,18 @@ impl LeaderElection {
 
             match action {
                 Action::Replicate => self.replicate_to_peers(),
-                Action::StartElection(term) => self.broadcast(&Message::RequestVote {
-                    term,
-                    candidate_id: self.self_id,
-                }),
+                Action::StartElection(term) => {
+                    let (last_log_index, last_log_term) = {
+                        let wal = self.wal.lock().unwrap();
+                        (wal.last_index(), wal.last_term())
+                    };
+                    self.broadcast(&Message::RequestVote {
+                        term,
+                        candidate_id: self.self_id,
+                        last_log_index,
+                        last_log_term,
+                    });
+                }
                 Action::None => {}
             }
 
@@ -341,7 +372,7 @@ impl LeaderElection {
     // ---- inbound control messages ----
 
     fn recv_loop(&self) {
-        let mut buf = [0u8; 1024];
+        let mut buf = [0u8; RECV_BUF_SIZE];
         loop {
             let (n, _src) = match self.socket.recv_from(&mut buf) {
                 Ok(v) => v,
@@ -349,7 +380,13 @@ impl LeaderElection {
             };
             let msg: Message = match serde_json::from_slice(&buf[..n]) {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(err) => {
+                    eprintln!(
+                        "[S2-{}] dropped raft packet ({} bytes): {err}",
+                        self.self_id, n
+                    );
+                    continue;
+                }
             };
             self.handle_message(msg);
         }
@@ -386,19 +423,56 @@ impl LeaderElection {
         }
 
         match msg {
-            Message::RequestVote { term, candidate_id } => {
-                let can_vote =
-                    term >= st.term && (st.voted_for.is_none() || st.voted_for == Some(candidate_id));
+            Message::RequestVote {
+                term,
+                candidate_id,
+                last_log_index,
+                last_log_term,
+            } => {
+                let (my_last_index, my_last_term) = {
+                    let wal = self.wal.lock().unwrap();
+                    (wal.last_index(), wal.last_term())
+                };
+                // Raft §5.4.1: vote only if candidate log is at least as up-to-date.
+                let log_ok = last_log_term > my_last_term
+                    || (last_log_term == my_last_term && last_log_index >= my_last_index);
+                let can_vote = term >= st.term
+                    && (st.voted_for.is_none() || st.voted_for == Some(candidate_id))
+                    && log_ok;
                 if can_vote {
                     st.voted_for = Some(candidate_id);
                     st.term = term;
                     st.last_heartbeat = Instant::now();
                     st.election_timeout = random_timeout();
-                    drop(st); // release lock before doing network I/O
+                    drop(st);
                     if let Some(candidate) = find_node(candidate_id) {
-                        println!("[S2-{}] granted vote to S2-{}", self.self_id, candidate_id);
-                        self.send(&candidate, &Message::VoteGranted { term, voter_id: self.self_id });
+                        println!(
+                            "[S2-{}] granted vote to S2-{} (candidate log {}/{} vs local {}/{})",
+                            self.self_id,
+                            candidate_id,
+                            last_log_index,
+                            last_log_term,
+                            my_last_index,
+                            my_last_term
+                        );
+                        self.send(
+                            &candidate,
+                            &Message::VoteGranted {
+                                term,
+                                voter_id: self.self_id,
+                            },
+                        );
                     }
+                } else if !log_ok {
+                    println!(
+                        "[S2-{}] denied vote to S2-{} — stale log (candidate {}/{} vs local {}/{})",
+                        self.self_id,
+                        candidate_id,
+                        last_log_index,
+                        last_log_term,
+                        my_last_index,
+                        my_last_term
+                    );
                 }
             }
             Message::VoteGranted { term, voter_id } => {
@@ -490,13 +564,27 @@ impl LeaderElection {
                     return;
                 }
                 if success {
+                    let prev_match = st.match_index.get(&follower_id).copied().unwrap_or(0);
                     st.match_index.insert(follower_id, match_index);
                     st.next_index.insert(follower_id, match_index + 1);
+                    if match_index > prev_match {
+                        println!(
+                            "[S2-{}] follower S2-{} matched through index {}",
+                            self.self_id, follower_id, match_index
+                        );
+                    }
                     drop(st);
                     self.try_advance_commit();
                 } else {
-                    let current = st.next_index.get(&follower_id).copied().unwrap_or(1);
-                    st.next_index.insert(follower_id, current.saturating_sub(1).max(1));
+                    // Jump using follower's last index instead of stepping back one-by-one.
+                    let hinted = match_index.saturating_add(1).max(1);
+                    let current = st.next_index.get(&follower_id).copied().unwrap_or(hinted);
+                    let next = hinted.min(current.saturating_sub(1)).max(1);
+                    println!(
+                        "[S2-{}] follower S2-{} reject (follower_last={}) next_index {} -> {}",
+                        self.self_id, follower_id, match_index, current, next
+                    );
+                    st.next_index.insert(follower_id, next);
                 }
             }
         }

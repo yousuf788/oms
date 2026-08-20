@@ -1,21 +1,19 @@
 // order-receiver (S3)
-// Deploy on Yousuf.
-//
-// Build: cargo build -p order-receiver --release
-// Run:   ./target/release/order-receiver
+// Bind host/port from `.env` (BIND_HOST, S3_PORT / RECEIVER_BIND_PORT).
 
 mod config;
 
-use config::{RECEIVER_BIND_HOST, RECEIVER_BIND_PORT};
+use config::init_config;
 use serde_json::Value;
 use std::net::UdpSocket;
 
 fn main() {
-    let socket = UdpSocket::bind((RECEIVER_BIND_HOST, RECEIVER_BIND_PORT))
+    let cfg = init_config();
+    let socket = UdpSocket::bind((cfg.bind_host.as_str(), cfg.bind_port))
         .expect("failed to bind receiver socket");
     println!(
         "[order-receiver] listening on {}:{}",
-        RECEIVER_BIND_HOST, RECEIVER_BIND_PORT
+        cfg.bind_host, cfg.bind_port
     );
 
     let mut buf = [0u8; 4096];
