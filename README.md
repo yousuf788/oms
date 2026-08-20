@@ -70,7 +70,7 @@ Follower nodes do not emit external results.
 
 ```bash
 cd order-process
-cp .env.example .env
+cp cluster.sample .env
 # edit NODE1_HOST / NODE2_HOST / NODE3_HOST / ports / S3_HOST
 ```
 
@@ -95,7 +95,14 @@ Use the **same `.env` content** on all three `order-process` machines. Set only 
 
 ---
 
-Current default config is localhost (`127.0.0.1`) for all S2 nodes and S3.
+Default cluster IPs (see `order-process/.env`):
+
+| Machine | Role | IP |
+|---|---|---|
+| Vivek | S2 node 1 | `172.16.12.104` |
+| Amit | S2 node 2 | `172.16.13.181` |
+| Nitin | S2 node 3 | `10.10.1.121` |
+| Yousuf | order-receiver (S3) | `10.10.1.69` |
 
 ### 1) Build each service
 

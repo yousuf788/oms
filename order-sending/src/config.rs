@@ -6,15 +6,15 @@ pub struct S2Node {
 
 pub const S2_NODES: [S2Node; 3] = [
     S2Node {
-        host: "127.0.0.1",
+        host: "172.16.12.104",
         order_port: 7001,
     },
     S2Node {
-        host: "127.0.0.1",
+        host: "172.16.13.181",
         order_port: 7002,
     },
     S2Node {
-        host: "127.0.0.1",
+        host: "10.10.1.121",
         order_port: 7003,
     },
 ];

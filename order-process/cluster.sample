@@ -1,0 +1,27 @@
+# order-process cluster config
+# Copy to `.env` on every order-process machine: cp cluster.sample .env
+
+BIND_HOST=0.0.0.0
+
+# ---- Node 1 (Vivek) ----
+NODE1_HOST=172.16.12.104
+NODE1_RAFT_PORT=6001
+NODE1_ORDER_PORT=7001
+
+# ---- Node 2 (Amit) ----
+NODE2_HOST=172.16.13.181
+NODE2_RAFT_PORT=6002
+NODE2_ORDER_PORT=7002
+
+# ---- Node 3 (Nitin) ----
+NODE3_HOST=10.10.1.121
+NODE3_RAFT_PORT=6003
+NODE3_ORDER_PORT=7003
+
+# order-receiver on Yousuf (LAN; Wi-Fi: 172.16.12.252)
+S3_HOST=10.10.1.69
+S3_PORT=8001
+
+HEARTBEAT_INTERVAL_MS=100
+ELECTION_TIMEOUT_MIN_MS=300
+ELECTION_TIMEOUT_MAX_MS=600
