@@ -81,6 +81,50 @@ pub fn config() -> &'static ClusterConfig {
     CONFIG.get().expect("config not initialized; call init_config() first")
 }
 
+fn local_ipv4_addrs() -> Vec<String> {
+    let mut ips = vec!["127.0.0.1".to_string()];
+    if let Ok(output) = std::process::Command::new("hostname").arg("-I").output() {
+        for token in String::from_utf8_lossy(&output.stdout).split_whitespace() {
+            if token.contains('.') && !token.contains(':') {
+                ips.push(token.to_string());
+            }
+        }
+    }
+    ips
+}
+
+/// Resolve this replica's id:
+/// 1. `NODE_ID` env if set
+/// 2. else match this machine's IP to NODE1/2/3_HOST in `.env`
+pub fn resolve_node_id() -> u8 {
+    if let Ok(raw) = env::var("NODE_ID") {
+        return raw
+            .parse::<u8>()
+            .unwrap_or_else(|_| panic!("NODE_ID must be 1, 2, or 3 (got {raw})"));
+    }
+
+    let cfg = config();
+    let locals = local_ipv4_addrs();
+    let matches: Vec<u8> = cfg
+        .nodes
+        .iter()
+        .filter(|n| locals.iter().any(|ip| ip == &n.host))
+        .map(|n| n.id)
+        .collect();
+
+    match matches.as_slice() {
+        [id] => *id,
+        [] => panic!(
+            "NODE_ID not set and no local IP matches NODE1/2/3_HOST in .env. \
+             Local IPs: {locals:?}. Set NODE_ID=1|2|3 or fix hosts in .env."
+        ),
+        _ => panic!(
+            "NODE_ID not set and multiple nodes match local IPs {locals:?} \
+             (typical for all-127.0.0.1 local demo). Pass NODE_ID=1|2|3."
+        ),
+    }
+}
+
 pub fn find_node(id: u8) -> Option<S2Node> {
     config().nodes.iter().find(|n| n.id == id).cloned()
 }

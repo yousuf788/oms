@@ -22,11 +22,19 @@ if ! command -v cargo >/dev/null 2>&1; then
   source "$HOME/.cargo/env"
 fi
 
-NODE_ID="${1:-${NODE_ID:-1}}"
-if [[ ! "$NODE_ID" =~ ^[123]$ ]]; then
-  echo "[starter] Invalid NODE_ID: $NODE_ID. Use 1, 2, or 3."
-  exit 1
+# Optional override: ./starter.sh 1|2|3
+# Otherwise the binary auto-detects NODE_ID from this machine's IP vs .env hosts.
+if [[ $# -ge 1 ]]; then
+  NODE_ID="$1"
+  if [[ ! "$NODE_ID" =~ ^[123]$ ]]; then
+    echo "[starter] Invalid NODE_ID: $NODE_ID. Use 1, 2, or 3 (or omit for auto-detect)."
+    exit 1
+  fi
+  export NODE_ID
+  echo "[starter] Starting order-process with NODE_ID=$NODE_ID"
+else
+  unset NODE_ID || true
+  echo "[starter] Starting order-process (NODE_ID auto-detect from local IP)"
 fi
 
-echo "[starter] Starting order-process with NODE_ID=$NODE_ID"
 cargo run --release --bin order-process

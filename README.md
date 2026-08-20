@@ -134,7 +134,7 @@ cp cluster.sample .env
 # edit IPs if needed
 ```
 
-Use the **same `.env` content** on all three `order-process` machines. Set only `NODE_ID` differently when starting (`./starter.sh 1` / `2` / `3`).
+Use the **same `.env` content** on all three `order-process` machines. On each machine run `./starter.sh` — `NODE_ID` is auto-detected from that machine’s IP vs `NODE1/2/3_HOST`. Override with `./starter.sh 1` (needed when all hosts are `127.0.0.1`).
 
 ---
 
@@ -158,17 +158,10 @@ cd ../order-receiver && cargo build --release
 ### 2) Run services (5 terminals)
 
 ```bash
-# Terminal 1
+# Terminal 1–3 (multi-machine: just ./starter.sh on each host)
 cd order-process
-NODE_ID=1 ./target/release/order-process
-
-# Terminal 2
-cd order-process
-NODE_ID=2 ./target/release/order-process
-
-# Terminal 3
-cd order-process
-NODE_ID=3 ./target/release/order-process
+./starter.sh          # auto NODE_ID from IP
+# or: ./starter.sh 1  # force id (local 127.0.0.1 demo)
 
 # Terminal 4
 cd order-receiver

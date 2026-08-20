@@ -1,13 +1,8 @@
 // order-process (S2 cluster replica)
-// Deploy on Vivek, Amit, Nitin — one replica per machine:
-//   Vivek: NODE_ID=1
-//   Amit:  NODE_ID=2
-//   Nitin: NODE_ID=3
-//
-// Build: cargo build -p order-process --release
-// Run:   NODE_ID=1 ./target/release/order-process
+// Multi-machine: same .env everywhere; NODE_ID is auto-detected from local IP.
+// Override: NODE_ID=1|2|3 ./starter.sh   (needed for all-localhost demos)
 
-use order_process::config::{find_node, init_config};
+use order_process::config::{find_node, init_config, resolve_node_id};
 use order_process::leader_election::LeaderElection;
 use order_process::wal::ReplicatedCommand;
 use rand::Rng;
@@ -25,10 +20,10 @@ struct Order {
 
 fn main() {
     let cfg = init_config();
-    let node_id: u8 = std::env::var("NODE_ID")
-        .expect("set NODE_ID to 1, 2, or 3")
-        .parse()
-        .expect("NODE_ID must be a number");
+    let node_id = resolve_node_id();
+    if !(1..=3).contains(&node_id) {
+        panic!("NODE_ID must be 1, 2, or 3 (got {node_id})");
+    }
 
     let self_node = find_node(node_id).expect("unknown NODE_ID");
     println!(
