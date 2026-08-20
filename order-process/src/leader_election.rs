@@ -207,6 +207,7 @@ impl LeaderElection {
         }
 
         self.replicate_to_peers();
+        self.try_advance_commit();
 
         let start = Instant::now();
         while start.elapsed() < Duration::from_millis(1500) {
@@ -221,6 +222,7 @@ impl LeaderElection {
                 }
             }
             self.replicate_to_peers();
+            self.try_advance_commit();
             thread::sleep(Duration::from_millis(20));
         }
         None
@@ -277,18 +279,35 @@ impl LeaderElection {
         }
     }
 
-    fn peers_unreachable(&self, st: &RaftState) -> bool {
-        allow_single_node_leader()
-            && st.last_peer_contact.elapsed() >= Duration::from_millis(peer_silent_ms())
+    fn peer_is_available(&self, st: &RaftState, peer_id: u8) -> bool {
+        let silent = Duration::from_millis(peer_silent_ms());
+        let last = st
+            .peer_last_contact
+            .get(&peer_id)
+            .copied()
+            .unwrap_or_else(Instant::now);
+        last.elapsed() < silent && st.peer_available.get(&peer_id).copied().unwrap_or(true)
     }
 
-    /// Majority of configured cluster, or 1 when peers have been silent (lab failover).
+    fn alive_node_count(&self, st: &RaftState) -> usize {
+        1 + self
+            .peers
+            .iter()
+            .filter(|p| self.peer_is_available(st, p.id))
+            .count()
+    }
+
+    fn peers_unreachable(&self, st: &RaftState) -> bool {
+        allow_single_node_leader() && self.alive_node_count(st) == 1
+    }
+
+    /// Majority of live nodes when single-node mode is on; else majority of full cluster (2 of 3).
     fn quorum_for(&self, st: &RaftState) -> usize {
-        let majority = (self.peers.len() + 1) / 2 + 1;
-        if self.peers_unreachable(st) {
-            1
+        if allow_single_node_leader() {
+            let alive = self.alive_node_count(st);
+            alive / 2 + 1
         } else {
-            majority
+            (self.peers.len() + 1) / 2 + 1
         }
     }
 
