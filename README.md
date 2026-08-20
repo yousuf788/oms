@@ -163,9 +163,10 @@ When peers are down:
 | File | Written by |
 |---|---|
 | `order-sending/logs/orders-sent.log` | every sent order |
+| `order-process/logs/orders-processed.log` | every order committed by the **leader** |
 | `order-receiver/logs/orders-received.log` | every received result |
 
-(`**/logs/` is gitignored.)
+Leader console also prints `[order] … LEADER received/committed …` lines.
 
 ---
 

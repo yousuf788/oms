@@ -8,7 +8,10 @@ use order_process::wal::ReplicatedCommand;
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
+use std::fs::{create_dir_all, OpenOptions};
+use std::io::Write;
 use std::net::UdpSocket;
+use std::path::PathBuf;
 
 #[derive(Deserialize, Debug)]
 struct Order {
@@ -72,12 +75,33 @@ fn main() {
     }
 }
 
+fn process_log_path() -> PathBuf {
+    PathBuf::from("logs").join("orders-processed.log")
+}
+
+fn append_process_log(line: &str) {
+    let path = process_log_path();
+    if let Some(parent) = path.parent() {
+        let _ = create_dir_all(parent);
+    }
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(file, "{line}");
+        let _ = file.flush();
+    }
+}
+
 fn process_order_as_leader(
     node_id: u8,
     order: &Order,
     election: &LeaderElection,
     result_socket: &UdpSocket,
 ) {
+    let leader = node_name(node_id);
+    println!(
+        "[order] {} LEADER received order_id={} {} {} qty={}",
+        leader, order.order_id, order.side, order.symbol, order.qty
+    );
+
     let outcomes = ["FILLED", "PARTIALLY_FILLED", "REJECTED"];
     let mut rng = rand::thread_rng();
     let status = outcomes[rng.gen_range(0..outcomes.len())];
@@ -94,7 +118,7 @@ fn process_order_as_leader(
         qty: order.qty,
         status: status.to_string(),
         filled_qty,
-        processed_by: format!("{} (S2-{})", node_name(node_id), node_id),
+        processed_by: format!("{} (S2-{})", leader, node_id),
         term: election.current_term(),
     };
 
@@ -114,5 +138,24 @@ fn process_order_as_leader(
         if let Ok(buf) = serde_json::to_vec(&result) {
             let _ = result_socket.send_to(&buf, (cfg.s3_host.as_str(), cfg.s3_port));
         }
+
+        let line = result.to_string();
+        append_process_log(&line);
+        println!(
+            "[order] {} LEADER committed order_id={} status={} filled={}/{} -> S3 {}:{} {}",
+            leader,
+            committed.order_id,
+            committed.status,
+            committed.filled_qty,
+            committed.qty,
+            cfg.s3_host,
+            cfg.s3_port,
+            line
+        );
+    } else {
+        println!(
+            "[order] {} LEADER dropped order_id={} (not committed / leadership lost)",
+            leader, order.order_id
+        );
     }
 }
