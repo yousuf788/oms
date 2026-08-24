@@ -70,6 +70,10 @@ struct RaftState {
     peer_available: HashMap<u8, bool>,
     /// Per-peer timestamp of last successful AppendAck — used for leader lease.
     peer_last_ack: HashMap<u8, Instant>,
+    /// The Raft term at which this node first became leader in the current tenure.
+    /// WAL entries at terms [leader_since_term, current_term] are safe to commit
+    /// even when a reconnecting peer bumps our term while we stay leader.
+    leader_since_term: u64,
 }
 
 fn random_timeout() -> Duration {
@@ -134,6 +138,7 @@ impl LeaderElection {
                 peer_last_contact,
                 peer_available,
                 peer_last_ack: HashMap::new(),
+                leader_since_term: 0,
             }),
             wal: Mutex::new(wal),
             is_leader_flag: AtomicBool::new(false),
@@ -225,7 +230,10 @@ impl LeaderElection {
         while start.elapsed() < Duration::from_millis(1500) {
             {
                 let st = self.state.lock().unwrap();
-                if st.role != Role::Leader || st.term != term {
+                // Only abort if we lost leadership entirely.
+                // A term bump while staying leader (log-dominance protection) is
+                // fine — the entry is still committed under our tenure.
+                if st.role != Role::Leader {
                     return None;
                 }
                 if st.last_applied >= entry.index {
@@ -372,6 +380,11 @@ impl LeaderElection {
         st.match_index.clear();
         st.match_index.insert(self.self_id, next_idx.saturating_sub(1));
         st.last_heartbeat = Instant::now();
+        // Record the term at which this leadership tenure started.
+        // When a reconnecting peer bumps our term (but we stay leader via log
+        // dominance), leader_since_term stays fixed so we can still commit
+        // entries created during the original term.
+        st.leader_since_term = st.term;
         self.is_leader_flag.store(true, Ordering::Relaxed);
         if self.peers_unreachable(st) {
             println!(
@@ -442,9 +455,9 @@ impl LeaderElection {
     }
 
     fn try_advance_commit(&self) {
-        let (current_term, current_commit, needed) = {
+        let (current_term, leader_since, current_commit, needed) = {
             let st = self.state.lock().unwrap();
-            (st.term, st.commit_index, self.quorum_for(&st))
+            (st.term, st.leader_since_term, st.commit_index, self.quorum_for(&st))
         };
         let wal = self.wal.lock().unwrap();
         let last_index = wal.last_index();
@@ -463,7 +476,12 @@ impl LeaderElection {
 
             if replicated >= needed {
                 let wal = self.wal.lock().unwrap();
-                if wal.get_term_at(idx) == Some(current_term) {
+                // Commit entries created during this leader's entire tenure
+                // (leader_since_term..=current_term). This allows entries
+                // appended before a peer-driven term bump to still commit
+                // without dropping in-flight orders.
+                let entry_term = wal.get_term_at(idx).unwrap_or(0);
+                if entry_term >= leader_since && entry_term <= current_term {
                     highest = idx;
                 }
             }
