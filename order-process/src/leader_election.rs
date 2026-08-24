@@ -82,6 +82,10 @@ pub struct LeaderElection {
     state: Mutex<RaftState>,
     wal: Mutex<Wal>,
     is_leader_flag: AtomicBool,
+    /// When this node started — used to enforce a startup grace period before
+    /// allowing single-node self-election. Prevents all nodes self-electing
+    /// simultaneously on startup before peers have had a chance to respond.
+    started_at: Instant,
 }
 
 impl LeaderElection {
@@ -95,9 +99,13 @@ impl LeaderElection {
             .filter(|n| n.id != self_id)
             .cloned()
             .collect();
+        // Peers are unknown at startup — treat contact time as now so the
+        // peer_silent_ms window starts from this moment, not from the past.
+        // peer_available starts false so we don't assume reachability until
+        // we actually hear from each peer.
         let peer_last_contact: HashMap<u8, Instant> =
             peers.iter().map(|p| (p.id, Instant::now())).collect();
-        let peer_available: HashMap<u8, bool> = peers.iter().map(|p| (p.id, true)).collect();
+        let peer_available: HashMap<u8, bool> = peers.iter().map(|p| (p.id, false)).collect();
 
         let bind_host = crate::config::config().bind_host.as_str();
         let socket = UdpSocket::bind((bind_host, self_node.raft_port))
@@ -126,6 +134,7 @@ impl LeaderElection {
             }),
             wal: Mutex::new(wal),
             is_leader_flag: AtomicBool::new(false),
+            started_at: Instant::now(),
         });
 
         println!(
@@ -298,15 +307,28 @@ impl LeaderElection {
     }
 
     fn peers_unreachable(&self, st: &RaftState) -> bool {
-        allow_single_node_leader() && self.alive_node_count(st) == 1
+        if !allow_single_node_leader() {
+            return false;
+        }
+        // Enforce a startup grace period equal to peer_silent_ms before allowing
+        // single-node self-election. This prevents all three nodes from treating
+        // each other as absent at startup and simultaneously self-electing.
+        let grace = Duration::from_millis(peer_silent_ms());
+        if self.started_at.elapsed() < grace {
+            return false;
+        }
+        self.alive_node_count(st) == 1
     }
 
-    /// Majority of live nodes when single-node mode is on; else majority of full cluster (2 of 3).
+    /// Majority needed to commit / win an election.
+    /// Always uses the full cluster size UNLESS all peers have been confirmed
+    /// unreachable for at least peer_silent_ms (single-node fallback).
     fn quorum_for(&self, st: &RaftState) -> usize {
-        if allow_single_node_leader() {
-            let alive = self.alive_node_count(st);
-            alive / 2 + 1
+        if self.peers_unreachable(st) {
+            // Every peer is silent — allow self-promotion with quorum of 1.
+            1
         } else {
+            // Standard Raft majority of the full cluster.
             (self.peers.len() + 1) / 2 + 1
         }
     }
@@ -327,17 +349,17 @@ impl LeaderElection {
         st.match_index.insert(self.self_id, next_idx.saturating_sub(1));
         st.last_heartbeat = Instant::now();
         self.is_leader_flag.store(true, Ordering::Relaxed);
-        let single = self.peers_unreachable(st);
-        if single {
+        if self.peers_unreachable(st) {
             println!(
                 "[role] {} is LEADER (single-node: other machines unreachable)",
                 node_name(self.self_id)
             );
+        } else {
+            println!(
+                "[role] {}",
+                format_role_summary(Some(self.self_id), &self.unavailable_peer_ids(st))
+            );
         }
-        println!(
-            "[role] {}",
-            format_role_summary(Some(self.self_id), &self.unavailable_peer_ids(st))
-        );
     }
 
     fn replicate_to_peers(&self) {
@@ -682,6 +704,9 @@ impl LeaderElection {
             Message::VoteGranted { term, voter_id } => {
                 if st.role == Role::Candidate && term == st.term {
                     st.votes.insert(voter_id);
+                    // Reset the heartbeat timer so we don't immediately re-trigger
+                    // an election timeout while waiting to accumulate quorum.
+                    st.last_heartbeat = Instant::now();
                     if st.votes.len() >= self.quorum_for(&st) {
                         self.become_leader_locked(&mut st);
                         drop(st);
