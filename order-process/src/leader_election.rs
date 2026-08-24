@@ -68,6 +68,8 @@ struct RaftState {
     peer_last_contact: HashMap<u8, Instant>,
     /// true = available; used to print only on change.
     peer_available: HashMap<u8, bool>,
+    /// Per-peer timestamp of last successful AppendAck — used for leader lease.
+    peer_last_ack: HashMap<u8, Instant>,
 }
 
 fn random_timeout() -> Duration {
@@ -131,6 +133,7 @@ impl LeaderElection {
                 last_peer_contact: Instant::now(),
                 peer_last_contact,
                 peer_available,
+                peer_last_ack: HashMap::new(),
             }),
             wal: Mutex::new(wal),
             is_leader_flag: AtomicBool::new(false),
@@ -331,6 +334,27 @@ impl LeaderElection {
             // Standard Raft majority of the full cluster.
             (self.peers.len() + 1) / 2 + 1
         }
+    }
+
+    /// Returns true if this leader has received successful AppendAck from a
+    /// quorum of followers within the last 4 heartbeat intervals.
+    /// When true, the leader's authority is still fresh and it should NOT be
+    /// displaced by a RequestVote from a stale/reconnecting node.
+    fn has_quorum_lease(&self, st: &RaftState) -> bool {
+        let lease_window = Duration::from_millis(heartbeat_interval_ms() * 4);
+        let quorum_needed = (self.peers.len() + 1) / 2 + 1; // majority of full cluster
+        // Count self + peers that acked within the lease window.
+        let recent_acks = 1 + self
+            .peers
+            .iter()
+            .filter(|p| {
+                st.peer_last_ack
+                    .get(&p.id)
+                    .map(|t| t.elapsed() < lease_window)
+                    .unwrap_or(false)
+            })
+            .count();
+        recent_acks >= quorum_needed
     }
 
     fn become_leader_locked(&self, st: &mut RaftState) {
@@ -629,20 +653,42 @@ impl LeaderElection {
 
         // Term fencing: anyone with a higher term is more current than us.
         if incoming_term > st.term {
-            let was_leader = st.role == Role::Leader;
-            st.term = incoming_term;
-            st.role = Role::Follower;
-            st.voted_for = None;
-            st.votes.clear();
-            st.next_index.clear();
-            st.match_index.clear();
-            st.last_heartbeat = Instant::now();
-            st.election_timeout = random_timeout();
-            if was_leader {
-                self.is_leader_flag.store(false, Ordering::Relaxed);
-                drop(st);
-                self.print_roles(None);
-                st = self.state.lock().unwrap();
+            // Leader lease: if we are a healthy leader with recent quorum acks,
+            // a RequestVote from a stale/reconnecting node should NOT displace us.
+            // We update our term (so we can still participate correctly) but keep
+            // the leader role.  The candidate will see our next heartbeat
+            // (AppendEntries at the new term) and quietly convert to follower.
+            let stay_as_leader = st.role == Role::Leader
+                && matches!(&msg, Message::RequestVote { .. })
+                && self.has_quorum_lease(&st);
+
+            st.term = incoming_term; // always adopt the higher term
+
+            if stay_as_leader {
+                // Keep leading; reset voted_for to ourselves so we don't
+                // accidentally grant a vote to the challenger in this term.
+                st.voted_for = Some(self.self_id);
+                if verbose_raft() {
+                    println!(
+                        "[S2-{}] leader lease active — staying LEADER at new term {}",
+                        self.self_id, st.term
+                    );
+                }
+            } else {
+                let was_leader = st.role == Role::Leader;
+                st.role = Role::Follower;
+                st.voted_for = None;
+                st.votes.clear();
+                st.next_index.clear();
+                st.match_index.clear();
+                st.last_heartbeat = Instant::now();
+                st.election_timeout = random_timeout();
+                if was_leader {
+                    self.is_leader_flag.store(false, Ordering::Relaxed);
+                    drop(st);
+                    self.print_roles(None);
+                    st = self.state.lock().unwrap();
+                }
             }
         }
 
@@ -787,6 +833,8 @@ impl LeaderElection {
                     let prev_match = st.match_index.get(&follower_id).copied().unwrap_or(0);
                     st.match_index.insert(follower_id, match_index);
                     st.next_index.insert(follower_id, match_index + 1);
+                    // Record the ack time for leader lease calculation.
+                    st.peer_last_ack.insert(follower_id, Instant::now());
                     if match_index > prev_match && verbose_raft() {
                         println!(
                             "[S2-{}] follower S2-{} matched through index {}",
