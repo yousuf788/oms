@@ -653,24 +653,48 @@ impl LeaderElection {
 
         // Term fencing: anyone with a higher term is more current than us.
         if incoming_term > st.term {
-            // Leader lease: if we are a healthy leader with recent quorum acks,
-            // a RequestVote from a stale/reconnecting node should NOT displace us.
-            // We update our term (so we can still participate correctly) but keep
-            // the leader role.  The candidate will see our next heartbeat
-            // (AppendEntries at the new term) and quietly convert to follower.
-            let stay_as_leader = st.role == Role::Leader
-                && matches!(&msg, Message::RequestVote { .. })
-                && self.has_quorum_lease(&st);
+            // A leader should only step down on a RequestVote if the challenger
+            // actually has a more up-to-date log.  A node that was offline and
+            // accumulated a high term through repeated failed elections has a
+            // STALE log — it cannot have committed anything the leader hasn't.
+            // Letting it displace the current leader causes unnecessary churn.
+            //
+            // Protections (either is enough to stay leader):
+            //  1. Quorum lease  — majority of peers acked within last 4 heartbeats.
+            //  2. Log dominance — our log is at least as current as the candidate's.
+            let stay_as_leader = st.role == Role::Leader && {
+                match &msg {
+                    Message::RequestVote {
+                        last_log_index,
+                        last_log_term,
+                        ..
+                    } => {
+                        // Check log freshness (Raft §5.4.1 comparison).
+                        let (my_last_index, my_last_term) = {
+                            let wal = self.wal.lock().unwrap();
+                            (wal.last_index(), wal.last_term())
+                        };
+                        let candidate_log_is_current = *last_log_term > my_last_term
+                            || (*last_log_term == my_last_term
+                                && *last_log_index >= my_last_index);
+                        // Stay if our log is better OR we still hold quorum.
+                        !candidate_log_is_current || self.has_quorum_lease(&st)
+                    }
+                    // AppendEntries from a higher term = another node is already
+                    // a valid leader → always step down.
+                    _ => false,
+                }
+            };
 
             st.term = incoming_term; // always adopt the higher term
 
             if stay_as_leader {
-                // Keep leading; reset voted_for to ourselves so we don't
-                // accidentally grant a vote to the challenger in this term.
+                // Keep leading; claim voted_for so we don't accidentally
+                // grant a vote to the stale challenger in this term.
                 st.voted_for = Some(self.self_id);
                 if verbose_raft() {
                     println!(
-                        "[S2-{}] leader lease active — staying LEADER at new term {}",
+                        "[S2-{}] ignored stale RequestVote — staying LEADER at term {}",
                         self.self_id, st.term
                     );
                 }
