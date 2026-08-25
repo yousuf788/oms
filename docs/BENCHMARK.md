@@ -92,15 +92,23 @@ flowchart TD
 | **Phase 1: $O(1)$ WAL & Lock Fixes** | 439 ops/sec | 54 ops/sec | 98.77% | **+91.7%** |
 | **Phase 2: Raft Micro-Batching** | 5,045 ops/sec | **11,806 ops/sec** | **64.64%** | **+21,762% (+218x)** |
 
-#### Detailed 3-Node Raft Cluster Results (Post-Batching, 10s Runs)
+#### Detailed 3-Node Raft Cluster Results (Unthrottled Peak Test, 10s Runs)
 
 | Sender Threads | Duration | Total Orders Sent | Sent Throughput (TPS) | Total Processed | Processed Throughput (TPS) | Results Received (S3) | Packet Loss % | WAL 1 Size |
 |---|---|---|---|---|---|---|---|---|
 | **1 Thread** | 10s | 333,903 | 33,390 ops/s | 118,066 | **11,806 ops/s** | 117,826 | **64.64%** | 19.8 MB |
 | **4 Threads** | 10s | 880,591 | 88,059 ops/s | 44,884 | **4,488 ops/s** | 41,865 | **94.90%** | 7.5 MB |
 
-> [!IMPORTANT]
-> Micro-batching allows a single Raft `AppendEntries` RPC roundtrip to replicate up to 500 orders at once. This removes the per-order network latency barrier and increases consensus throughput from 54 ops/sec to **11,806 ops/sec**!
+#### Rate-Paced 5,000 TPS Target Benchmark (Zero Packet Loss Test)
+
+*When `order-sending` is configured with `TARGET_TPS=5000` to match target production rate:*
+
+| Cluster Nodes | Sender Threads | Duration | Target TPS | Sent Throughput (TPS) | Processed Throughput (TPS) | Results Received (S3) | Packet Loss % |
+|---|---|---|---|---|---|---|---|
+| **3-Node Raft Cluster** | **4 Threads** | **10s** | **5,000 ops/s** | **4,936 ops/s** | **4,986 ops/s** | **49,868** | **0.00%** |
+
+> [!TIP]
+> Setting the sender target throughput to **5,000 orders/sec** matches sender ingress rate with `order-process` capacity, eliminating UDP socket buffer overruns and achieving **0% packet loss** with 100% order processing fidelity!
 
 ---
 

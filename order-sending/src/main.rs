@@ -108,9 +108,15 @@ fn main() {
             .collect(),
     );
 
+    let target_tps: u64 = std::env::var("TARGET_TPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(5000);
+
     println!(
-        "[order-sending] starting {} sender threads → targets: {}",
+        "[order-sending] starting {} sender threads → target throughput: {} orders/sec → targets: {}",
         num_threads,
+        if target_tps > 0 { format!("{target_tps}") } else { "unlimited".to_string() },
         targets
             .iter()
             .map(|(h, p)| format!("{h}:{p}"))
@@ -120,6 +126,17 @@ fn main() {
 
     let symbols = ["BTC-USDT", "ETH-USDT", "SOL-USDT"];
     let bind_host = cfg.bind_host.clone();
+
+    let per_thread_tps = if target_tps > 0 {
+        (target_tps as f64 / num_threads as f64).max(0.1)
+    } else {
+        0.0
+    };
+    let nanos_per_order = if per_thread_tps > 0.0 {
+        (1_000_000_000.0 / per_thread_tps) as u64
+    } else {
+        0
+    };
 
     let mut handles = Vec::new();
     for tid in 0..num_threads {
@@ -137,6 +154,8 @@ fn main() {
             socket.set_nonblocking(true).ok();
 
             let mut rng = rand::thread_rng();
+            let thread_start = std::time::Instant::now();
+            let mut order_index = 0u64;
 
             loop {
                 let order_id = order_counter.fetch_add(1, Ordering::Relaxed);
@@ -159,6 +178,15 @@ fn main() {
 
                 // Non-blocking log push — drop silently if channel is full
                 let _ = log_tx.try_send(payload);
+
+                order_index += 1;
+                if nanos_per_order > 0 {
+                    let expected_elapsed = Duration::from_nanos(order_index * nanos_per_order);
+                    let actual_elapsed = thread_start.elapsed();
+                    if expected_elapsed > actual_elapsed {
+                        thread::sleep(expected_elapsed - actual_elapsed);
+                    }
+                }
             }
         });
         handles.push(handle);

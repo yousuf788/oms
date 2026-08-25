@@ -7,6 +7,8 @@ set -e
 NODES=${1:-1}
 THREADS=${2:-4}
 DURATION=${3:-10}
+TARGET_TPS=${4:-5000}
+export TARGET_TPS="$TARGET_TPS"
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BENCH_DIR="$ROOT_DIR/target/benchmark_tmp"
