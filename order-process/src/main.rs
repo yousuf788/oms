@@ -8,6 +8,7 @@ use order_process::wal::ReplicatedCommand;
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
+use std::collections::HashSet;
 use std::net::UdpSocket;
 use std::thread;
 
@@ -41,6 +42,23 @@ fn main() {
     let election = LeaderElection::start(node_id);
     let order_socket = UdpSocket::bind((cfg.bind_host.as_str(), self_node.order_port))
         .expect("failed to bind order channel");
+    // Increase OS receive buffer to 8 MB to absorb bursts during Raft consensus.
+    // This reduces order drops when the leader is busy committing a batch.
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        unsafe {
+            let fd = order_socket.as_raw_fd();
+            let buf_size: libc::c_int = 8 * 1024 * 1024; // 8 MB
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+    }
     order_socket.set_nonblocking(true).ok();
 
     let result_socket =
@@ -56,12 +74,16 @@ fn main() {
             last_role_line = line;
         }
 
-        let mut orders = Vec::with_capacity(500);
+        let mut orders: Vec<Order> = Vec::with_capacity(500);
+        let mut seen_ids: HashSet<u64> = HashSet::with_capacity(500);
         while orders.len() < 500 {
             match order_socket.recv_from(&mut buf) {
                 Ok((n, _src)) => {
                     if let Ok(order) = serde_json::from_slice::<Order>(&buf[..n]) {
-                        orders.push(order);
+                        // Deduplicate: same order_id may arrive from multiple sender threads.
+                        if seen_ids.insert(order.order_id) {
+                            orders.push(order);
+                        }
                     }
                 }
                 Err(_) => break,

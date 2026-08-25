@@ -48,6 +48,7 @@ name = "order-process"
 version = "0.1.0"
 dependencies = [
  "dotenvy",
+ "libc",
  "rand",
  "serde",
  "serde_json",

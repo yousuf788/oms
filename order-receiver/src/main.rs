@@ -6,6 +6,7 @@ mod config;
 
 use config::init_config;
 use serde_json::Value;
+use std::collections::HashSet;
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use std::net::UdpSocket;
@@ -46,12 +47,28 @@ fn main() {
     );
 
     let mut buf = [0u8; 4096];
+    // Deduplication set: prevents double-counting if a leadership change causes
+    // two nodes to send a result for the same order_id.
+    let mut seen_order_ids: HashSet<u64> = HashSet::new();
+
     loop {
         let (n, src) = match socket.recv_from(&mut buf) {
             Ok(v) => v,
             Err(_) => continue,
         };
         if let Ok(mut result) = serde_json::from_slice::<Value>(&buf[..n]) {
+            // Extract order_id for deduplication.
+            let order_id = result
+                .get("order_id")
+                .and_then(|v| v.as_u64());
+
+            if let Some(id) = order_id {
+                if !seen_order_ids.insert(id) {
+                    // Already received a result for this order_id — skip duplicate.
+                    continue;
+                }
+            }
+
             if let Some(obj) = result.as_object_mut() {
                 obj.insert("from".to_string(), Value::String(src.to_string()));
                 obj.insert("received_ts_ms".to_string(), json_u128(now_ms()));
