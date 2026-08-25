@@ -8,11 +8,7 @@ use order_process::wal::ReplicatedCommand;
 use rand::Rng;
 use serde::Deserialize;
 use serde_json::json;
-use std::fs::{create_dir_all, OpenOptions};
-use std::io::Write;
 use std::net::UdpSocket;
-use std::path::PathBuf;
-use std::sync::mpsc;
 use std::thread;
 
 #[derive(Deserialize, Debug)]
@@ -50,43 +46,6 @@ fn main() {
     let result_socket =
         UdpSocket::bind((cfg.bind_host.as_str(), 0)).expect("failed to bind result socket");
 
-    // Async background log writer for orders-processed.log
-    let (log_tx, log_rx) = mpsc::sync_channel::<String>(1_000_000);
-    {
-        let path = process_log_path();
-        thread::spawn(move || {
-            if let Some(parent) = path.parent() {
-                let _ = create_dir_all(parent);
-            }
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .expect("cannot open orders-processed.log");
-            let mut buf = String::with_capacity(128 * 1024);
-            loop {
-                match log_rx.recv_timeout(std::time::Duration::from_millis(50)) {
-                    Ok(line) => {
-                        buf.push_str(&line);
-                        buf.push('\n');
-                        if buf.len() >= 65536 {
-                            let _ = file.write_all(buf.as_bytes());
-                            let _ = file.flush();
-                            buf.clear();
-                        }
-                    }
-                    Err(_) => {
-                        if !buf.is_empty() {
-                            let _ = file.write_all(buf.as_bytes());
-                            let _ = file.flush();
-                            buf.clear();
-                        }
-                    }
-                }
-            }
-        });
-    }
-
     let mut last_role_line = String::new();
     let mut buf = [0u8; 4096];
 
@@ -115,13 +74,9 @@ fn main() {
         }
 
         if election.is_leader() {
-            process_orders_batch_as_leader(node_id, &orders, &election, &result_socket, &log_tx);
+            process_orders_batch_as_leader(node_id, &orders, &election, &result_socket);
         }
     }
-}
-
-fn process_log_path() -> PathBuf {
-    PathBuf::from("logs").join("orders-processed.log")
 }
 
 fn process_orders_batch_as_leader(
@@ -129,7 +84,6 @@ fn process_orders_batch_as_leader(
     orders: &[Order],
     election: &LeaderElection,
     result_socket: &UdpSocket,
-    log_tx: &mpsc::SyncSender<String>,
 ) {
     let leader = node_name(node_id);
     let verbose = order_process::config::verbose_raft();
@@ -182,10 +136,8 @@ fn process_orders_batch_as_leader(
             let _ = result_socket.send_to(&buf, (cfg.s3_host.as_str(), cfg.s3_port));
         }
 
-        let line = result.to_string();
-        let _ = log_tx.try_send(line.clone());
-
         if verbose {
+            let line = result.to_string();
             println!(
                 "[order] {} LEADER committed order_id={} status={} filled={}/{} -> S3 {}:{} {}",
                 leader,

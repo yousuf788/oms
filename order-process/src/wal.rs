@@ -32,9 +32,13 @@ impl Wal {
     pub fn new(node_id: u8) -> io::Result<Self> {
         let base_dir = std::env::var("ORDER_PROCESS_DATA_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("order-process/data"));
+            .unwrap_or_else(|_| PathBuf::from("logs"));
         fs::create_dir_all(&base_dir)?;
-        let path = base_dir.join(format!("wal-s2-{}.log", node_id));
+        let path = if std::env::var("ORDER_PROCESS_DATA_DIR").is_ok() {
+            base_dir.join(format!("orders-processed-s2-{}.log", node_id))
+        } else {
+            base_dir.join("orders-processed.log")
+        };
         let entries = Self::load_entries(&path)?;
         let file = OpenOptions::new()
             .create(true)

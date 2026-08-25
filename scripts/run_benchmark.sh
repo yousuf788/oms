@@ -119,7 +119,9 @@ if [ -f "$ROOT_DIR/order-sending/logs/orders-sent.log" ]; then
     SENT_COUNT=$(wc -l < "$ROOT_DIR/order-sending/logs/orders-sent.log" | tr -d ' ')
 fi
 
-if [ -f "$ROOT_DIR/order-process/logs/orders-processed.log" ]; then
+if [ -f "$BENCH_DIR/wal_data/orders-processed-s2-1.log" ]; then
+    PROCESSED_COUNT=$(wc -l < "$BENCH_DIR/wal_data/orders-processed-s2-1.log" | tr -d ' ')
+elif [ -f "$ROOT_DIR/order-process/logs/orders-processed.log" ]; then
     PROCESSED_COUNT=$(wc -l < "$ROOT_DIR/order-process/logs/orders-processed.log" | tr -d ' ')
 fi
 
@@ -138,8 +140,10 @@ else
 fi
 
 WAL_SIZE_KB=0
-if [ -f "$BENCH_DIR/wal_data/wal-s2-1.log" ]; then
-    WAL_SIZE_KB=$(du -k "$BENCH_DIR/wal_data/wal-s2-1.log" | cut -f1)
+if [ -f "$BENCH_DIR/wal_data/orders-processed-s2-1.log" ]; then
+    WAL_SIZE_KB=$(du -k "$BENCH_DIR/wal_data/orders-processed-s2-1.log" | cut -f1)
+elif [ -f "$ROOT_DIR/order-process/logs/orders-processed.log" ]; then
+    WAL_SIZE_KB=$(du -k "$ROOT_DIR/order-process/logs/orders-processed.log" | cut -f1)
 fi
 
 echo "=========================================================="
