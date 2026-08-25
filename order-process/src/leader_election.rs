@@ -281,6 +281,9 @@ impl LeaderElection {
 
         let start = Instant::now();
         while start.elapsed() < Duration::from_millis(1500) {
+            // Always drive commit + apply so single-node (all peers down) works.
+            self.try_advance_commit();
+            self.apply_committed_entries();
             {
                 let st = self.state.lock().unwrap();
                 if st.role != Role::Leader {
@@ -294,8 +297,8 @@ impl LeaderElection {
                         .collect();
                 }
             }
+            // Replicate to any peers that may have rejoined.
             self.replicate_to_peers();
-            self.try_advance_commit();
             thread::sleep(Duration::from_millis(1));
         }
         Vec::new()
@@ -544,6 +547,7 @@ impl LeaderElection {
         if highest > current_commit {
             let mut st = self.state.lock().unwrap();
             st.commit_index = highest;
+            drop(st);
         }
         self.apply_committed_entries();
     }
