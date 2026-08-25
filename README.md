@@ -137,6 +137,20 @@ cd order-process
 
 `starter.sh` loads `.env`, installs Rust via rustup if needed, and runs release.
 
+### Benchmarking
+
+Automated performance benchmarking scripts and detailed performance limit reports are available:
+
+```bash
+# Run 1-node baseline benchmark (1 node, 4 threads, 10s duration)
+./scripts/run_benchmark.sh 1 4 10
+
+# Run 3-node Raft consensus benchmark (3 nodes, 8 threads, 10s duration)
+./scripts/run_benchmark.sh 3 8 10
+```
+
+Detailed metrics, bottleneck analysis ($O(N)$ WAL rewrite, UDP socket buffer overruns, `fsync` overhead), and optimization roadmap are documented in [`docs/BENCHMARK.md`](docs/BENCHMARK.md).
+
 **On Yousuf (receiver + sender):**
 
 ```bash

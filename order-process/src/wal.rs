@@ -24,6 +24,7 @@ pub struct LogEntry {
 
 pub struct Wal {
     path: PathBuf,
+    file: fs::File,
     entries: Vec<LogEntry>,
 }
 
@@ -35,6 +36,11 @@ impl Wal {
         fs::create_dir_all(&base_dir)?;
         let path = base_dir.join(format!("wal-s2-{}.log", node_id));
         let entries = Self::load_entries(&path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+
         if crate::config::verbose_raft() {
             println!(
                 "[wal] opened {} ({} entries, last_index={})",
@@ -43,7 +49,7 @@ impl Wal {
                 entries.last().map(|e| e.index).unwrap_or(0)
             );
         }
-        Ok(Self { path, entries })
+        Ok(Self { path, file, entries })
     }
 
     fn load_entries(path: &PathBuf) -> io::Result<Vec<LogEntry>> {
@@ -61,7 +67,14 @@ impl Wal {
         Ok(entries)
     }
 
-    fn persist(&self) -> io::Result<()> {
+    fn append_single_entry(&mut self, entry: &LogEntry) -> io::Result<()> {
+        let line = serde_json::to_string(entry)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+        writeln!(self.file, "{line}")?;
+        Ok(())
+    }
+
+    fn rewrite_all(&mut self) -> io::Result<()> {
         let mut out = String::new();
         for entry in &self.entries {
             let line = serde_json::to_string(entry)
@@ -75,7 +88,11 @@ impl Wal {
             .truncate(true)
             .open(&self.path)?;
         file.write_all(out.as_bytes())?;
-        file.sync_all()?;
+        file.flush()?;
+        self.file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)?;
         Ok(())
     }
 
@@ -99,22 +116,41 @@ impl Wal {
         if index == 0 {
             return Some(0);
         }
+        if let Some(e) = self.entries.get((index - 1) as usize) {
+            if e.index == index {
+                return Some(e.term);
+            }
+        }
         self.entries
-            .iter()
-            .find(|entry| entry.index == index)
-            .map(|entry| entry.term)
+            .binary_search_by_key(&index, |entry| entry.index)
+            .ok()
+            .map(|idx| self.entries[idx].term)
     }
 
     pub fn entries_from(&self, from_index: u64) -> Vec<LogEntry> {
-        self.entries
-            .iter()
-            .filter(|entry| entry.index >= from_index)
-            .cloned()
-            .collect()
+        if from_index == 0 {
+            return self.entries.clone();
+        }
+        let start = match self.entries.binary_search_by_key(&from_index, |e| e.index) {
+            Ok(idx) => idx,
+            Err(idx) => idx,
+        };
+        self.entries[start..].to_vec()
     }
 
     pub fn entry_at(&self, index: u64) -> Option<LogEntry> {
-        self.entries.iter().find(|entry| entry.index == index).cloned()
+        if index == 0 {
+            return None;
+        }
+        if let Some(e) = self.entries.get((index - 1) as usize) {
+            if e.index == index {
+                return Some(e.clone());
+            }
+        }
+        self.entries
+            .binary_search_by_key(&index, |entry| entry.index)
+            .ok()
+            .map(|idx| self.entries[idx].clone())
     }
 
     pub fn append_leader_entry(&mut self, term: u64, command: ReplicatedCommand) -> io::Result<LogEntry> {
@@ -123,9 +159,35 @@ impl Wal {
             term,
             command,
         };
+        self.append_single_entry(&entry)?;
         self.entries.push(entry.clone());
-        self.persist()?;
         Ok(entry)
+    }
+
+    pub fn append_leader_batch(
+        &mut self,
+        term: u64,
+        commands: Vec<ReplicatedCommand>,
+    ) -> io::Result<Vec<LogEntry>> {
+        let mut entries = Vec::with_capacity(commands.len());
+        let mut out = String::with_capacity(commands.len() * 150);
+        let mut last_idx = self.last_index();
+        for command in commands {
+            last_idx += 1;
+            let entry = LogEntry {
+                index: last_idx,
+                term,
+                command,
+            };
+            let line = serde_json::to_string(&entry)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+            out.push_str(&line);
+            out.push('\n');
+            entries.push(entry.clone());
+        }
+        self.file.write_all(out.as_bytes())?;
+        self.entries.extend(entries.clone());
+        Ok(entries)
     }
 
     pub fn append_entries_from_leader(
@@ -141,18 +203,24 @@ impl Wal {
             return Ok(None);
         }
 
+        let mut truncated = false;
         for incoming in incoming_entries {
             if let Some(existing) = self.entry_at(incoming.index) {
                 if existing.term != incoming.term {
                     self.entries.retain(|entry| entry.index < incoming.index);
                     self.entries.push(incoming.clone());
+                    truncated = true;
                 }
             } else {
+                self.append_single_entry(incoming)?;
                 self.entries.push(incoming.clone());
             }
         }
-        self.entries.sort_by_key(|entry| entry.index);
-        self.persist()?;
+
+        if truncated {
+            self.entries.sort_by_key(|entry| entry.index);
+            self.rewrite_all()?;
+        }
         Ok(Some(self.last_index()))
     }
 }

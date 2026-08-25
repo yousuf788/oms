@@ -248,6 +248,59 @@ impl LeaderElection {
         None
     }
 
+    pub fn propose_batch(&self, commands: Vec<ReplicatedCommand>) -> Vec<ReplicatedCommand> {
+        if commands.is_empty() {
+            return Vec::new();
+        }
+        let term = self.current_term();
+        if !self.is_leader() {
+            return Vec::new();
+        }
+
+        let entries = {
+            let mut wal = self.wal.lock().unwrap();
+            match wal.append_leader_batch(term, commands) {
+                Ok(e) => e,
+                Err(_) => return Vec::new(),
+            }
+        };
+
+        if entries.is_empty() {
+            return Vec::new();
+        }
+
+        let max_index = entries.last().unwrap().index;
+
+        {
+            let mut st = self.state.lock().unwrap();
+            st.match_index.insert(self.self_id, max_index);
+        }
+
+        self.replicate_to_peers();
+        self.try_advance_commit();
+
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_millis(1500) {
+            {
+                let st = self.state.lock().unwrap();
+                if st.role != Role::Leader {
+                    return Vec::new();
+                }
+                if st.last_applied >= max_index {
+                    let wal = self.wal.lock().unwrap();
+                    return entries
+                        .iter()
+                        .filter_map(|e| wal.entry_at(e.index).map(|c| c.command))
+                        .collect();
+                }
+            }
+            self.replicate_to_peers();
+            self.try_advance_commit();
+            thread::sleep(Duration::from_millis(1));
+        }
+        Vec::new()
+    }
+
     fn send(&self, peer: &S2Node, msg: &Message) {
         if let Ok(buf) = serde_json::to_vec(msg) {
             let _ = self.socket.send_to(&buf, (peer.host.as_str(), peer.raft_port));
@@ -455,37 +508,38 @@ impl LeaderElection {
     }
 
     fn try_advance_commit(&self) {
-        let (current_term, leader_since, current_commit, needed) = {
+        let (current_term, leader_since, current_commit, needed, match_map) = {
             let st = self.state.lock().unwrap();
-            (st.term, st.leader_since_term, st.commit_index, self.quorum_for(&st))
+            (
+                st.term,
+                st.leader_since_term,
+                st.commit_index,
+                self.quorum_for(&st),
+                st.match_index.clone(),
+            )
         };
         let wal = self.wal.lock().unwrap();
         let last_index = wal.last_index();
-        drop(wal);
 
         let mut highest = current_commit;
         for idx in (current_commit + 1)..=last_index {
             let mut replicated = 1;
-            let st = self.state.lock().unwrap();
             for peer in &self.peers {
-                if st.match_index.get(&peer.id).copied().unwrap_or(0) >= idx {
+                if match_map.get(&peer.id).copied().unwrap_or(0) >= idx {
                     replicated += 1;
                 }
             }
-            drop(st);
 
             if replicated >= needed {
-                let wal = self.wal.lock().unwrap();
-                // Commit entries created during this leader's entire tenure
-                // (leader_since_term..=current_term). This allows entries
-                // appended before a peer-driven term bump to still commit
-                // without dropping in-flight orders.
                 let entry_term = wal.get_term_at(idx).unwrap_or(0);
                 if entry_term >= leader_since && entry_term <= current_term {
                     highest = idx;
                 }
+            } else {
+                break;
             }
         }
+        drop(wal);
 
         if highest > current_commit {
             let mut st = self.state.lock().unwrap();
@@ -495,32 +549,29 @@ impl LeaderElection {
     }
 
     fn apply_committed_entries(&self) {
-        loop {
-            let (next_to_apply, commit_index) = {
-                let st = self.state.lock().unwrap();
-                (st.last_applied + 1, st.commit_index)
-            };
-            if next_to_apply > commit_index {
-                break;
-            }
+        let (next_to_apply, commit_index) = {
+            let st = self.state.lock().unwrap();
+            (st.last_applied + 1, st.commit_index)
+        };
+        if next_to_apply > commit_index {
+            return;
+        }
 
-            let entry = {
-                let wal = self.wal.lock().unwrap();
-                wal.entry_at(next_to_apply)
-            };
-            if let Some(applied) = entry {
-                if verbose_raft() {
-                    println!(
-                        "[S2-{}] applied index={} term={} order_id={}",
-                        self.self_id, applied.index, applied.term, applied.command.order_id
-                    );
-                }
-                let mut st = self.state.lock().unwrap();
-                if st.last_applied < applied.index {
-                    st.last_applied = applied.index;
-                }
+        let mut highest_applied = next_to_apply - 1;
+        let wal = self.wal.lock().unwrap();
+        for idx in next_to_apply..=commit_index {
+            if wal.entry_at(idx).is_some() {
+                highest_applied = idx;
             } else {
                 break;
+            }
+        }
+        drop(wal);
+
+        if highest_applied >= next_to_apply {
+            let mut st = self.state.lock().unwrap();
+            if st.last_applied < highest_applied {
+                st.last_applied = highest_applied;
             }
         }
     }
