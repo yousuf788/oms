@@ -1,16 +1,23 @@
-// order-process (S2 cluster replica)
-// Multi-machine: same .env everywhere; NODE_ID is auto-detected from local IP.
-// Override: NODE_ID=1|2|3 ./starter.sh   (needed for all-localhost demos)
+// order-process (S2 cluster replica) — Aeron transport
+// Subscribes to order channel via Aeron (replaces raw UDP recv).
+// Publishes committed results to S3 via Aeron (replaces raw UDP send).
+// All Raft consensus, WAL, and leader election logic is unchanged.
 
 use order_process::config::{find_node, init_config, node_name, resolve_node_id};
 use order_process::leader_election::LeaderElection;
 use order_process::wal::ReplicatedCommand;
 use rand::Rng;
+use rusteron_client::*;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashSet;
-use std::net::UdpSocket;
+use std::ffi::CString;
+use std::sync::{Arc, Mutex};
 use std::thread;
+use std::time::Duration;
+
+const ORDER_STREAM_ID: i32 = 1001;
+const RESULT_STREAM_ID: i32 = 2001;
 
 #[derive(Deserialize, Debug)]
 struct Order {
@@ -18,6 +25,19 @@ struct Order {
     symbol: String,
     side: String,
     qty: u32,
+}
+
+fn aeron_dir() -> String {
+    std::env::var("AERON_DIR")
+        .unwrap_or_else(|_| {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                extern "C" { fn getuid() -> u32; }
+                format!("/dev/shm/aeron-{}", getuid())
+            }
+            #[cfg(not(target_os = "linux"))]
+            "/dev/shm/aeron-0".to_string()
+        })
 }
 
 fn main() {
@@ -39,64 +59,116 @@ fn main() {
             .join(", ")
     );
 
+    // ── Connect to Aeron Media Driver ──────────────────────────────────────────
+    let aeron_dir_path = aeron_dir();
+    println!("[order-process] connecting to Aeron Media Driver at {aeron_dir_path}");
+
+    let ctx = AeronContext::new().expect("Aeron context");
+    let aeron_dir_cstr = CString::new(aeron_dir_path).unwrap();
+    ctx.set_dir(&aeron_dir_cstr).expect("set aeron dir");
+    ctx.set_error_handler(Some(|code: i32, msg: &str| {
+        eprintln!("[aeron] error {code}: {msg}");
+    })).expect("set error handler");
+
+    let aeron = Aeron::new(&ctx).expect("Aeron client");
+    aeron.start().expect("start aeron client");
+
+    // ── Subscribe to order channel ─────────────────────────────────────────────
+    // Each S2 node subscribes on its own host:order_port.
+    // S1 (order-sending) publishes to each of these unicast endpoints.
+    let order_channel = format!(
+        "aeron:udp?endpoint={}:{}",
+        self_node.host, self_node.order_port
+    );
+    println!(
+        "[order-process] subscribing to orders on {order_channel} stream {ORDER_STREAM_ID}"
+    );
+    let order_channel_cstr = CString::new(order_channel).unwrap();
+    let order_subscription = aeron
+        .async_add_subscription(
+            &order_channel_cstr,
+            ORDER_STREAM_ID,
+            Handlers::NONE,
+            Handlers::NONE,
+        )
+        .expect("async_add_subscription (orders)")
+        .poll_blocking(Duration::from_secs(10))
+        .expect("order subscription ready");
+
+    // ── Publication to order-receiver (S3) ────────────────────────────────────
+    // All 3 nodes create this publication. Only the active leader calls offer().
+    let result_channel = format!("aeron:udp?endpoint={}:{}", cfg.s3_host, cfg.s3_port);
+    println!(
+        "[order-process] adding result publication → {result_channel} stream {RESULT_STREAM_ID}"
+    );
+    let result_channel_cstr = CString::new(result_channel).unwrap();
+    let result_pub = aeron
+        .async_add_publication(&result_channel_cstr, RESULT_STREAM_ID)
+        .expect("async_add_publication (results)")
+        .poll_blocking(Duration::from_secs(10))
+        .expect("result publication ready");
+
+    let result_pub = Arc::new(result_pub);
+
+    // ── Start Raft election ────────────────────────────────────────────────────
     let election = LeaderElection::start(node_id);
-    let order_socket = UdpSocket::bind((cfg.bind_host.as_str(), self_node.order_port))
-        .expect("failed to bind order channel");
-    // Increase OS receive buffer to 8 MB to absorb bursts during Raft consensus.
-    // This reduces order drops when the leader is busy committing a batch.
-    #[cfg(target_os = "linux")]
-    {
-        use std::os::unix::io::AsRawFd;
-        unsafe {
-            let fd = order_socket.as_raw_fd();
-            let buf_size: libc::c_int = 8 * 1024 * 1024; // 8 MB
-            libc::setsockopt(
-                fd,
-                libc::SOL_SOCKET,
-                libc::SO_RCVBUF,
-                &buf_size as *const _ as *const libc::c_void,
-                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
-            );
-        }
-    }
-    order_socket.set_nonblocking(true).ok();
 
-    let result_socket =
-        UdpSocket::bind((cfg.bind_host.as_str(), 0)).expect("failed to bind result socket");
-
+    // ── Main processing loop ───────────────────────────────────────────────────
     let mut last_role_line = String::new();
-    let mut buf = [0u8; 4096];
+
+    // Shared dedup set wrapped in Mutex so the fragment handler closure can use it
+    let seen_ids: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
+    let pending_orders: Arc<Mutex<Vec<Order>>> = Arc::new(Mutex::new(Vec::with_capacity(500)));
+
+    let mut idle = BackoffIdleStrategy::new();
 
     loop {
+        // Print role changes
         let line = election.role_summary();
         if line != last_role_line {
             println!("[role] {line}");
             last_role_line = line;
         }
 
-        let mut orders: Vec<Order> = Vec::with_capacity(500);
-        let mut seen_ids: HashSet<u64> = HashSet::with_capacity(500);
-        while orders.len() < 500 {
-            match order_socket.recv_from(&mut buf) {
-                Ok((n, _src)) => {
-                    if let Ok(order) = serde_json::from_slice::<Order>(&buf[..n]) {
-                        // Deduplicate: same order_id may arrive from multiple sender threads.
-                        if seen_ids.insert(order.order_id) {
-                            orders.push(order);
+        // Drain up to 500 orders from the Aeron subscription into pending_orders
+        {
+            let seen_ids = Arc::clone(&seen_ids);
+            let pending_orders = Arc::clone(&pending_orders);
+            let fragments = order_subscription
+                .poll_fn(move |buf: &[u8], _hdr: AeronHeader| {
+                    if let Ok(order) = serde_json::from_slice::<Order>(buf) {
+                        let mut pending = pending_orders.lock().unwrap();
+                        if pending.len() >= 500 {
+                            return; // batch full
+                        }
+                        let mut seen = seen_ids.lock().unwrap();
+                        if seen.insert(order.order_id) {
+                            pending.push(order);
                         }
                     }
-                }
-                Err(_) => break,
-            }
+                }, 500)
+                .unwrap_or(0);
+            idle.idle(fragments);
         }
 
-        if orders.is_empty() {
-            thread::sleep(std::time::Duration::from_micros(200));
-            continue;
-        }
+        // Check if we have orders to process
+        let orders = {
+            let mut pending = pending_orders.lock().unwrap();
+            if pending.is_empty() {
+                continue;
+            }
+            // Clear the seen set periodically (when batch drains)
+            seen_ids.lock().unwrap().clear();
+            std::mem::take(&mut *pending)
+        };
 
         if election.is_leader() {
-            process_orders_batch_as_leader(node_id, &orders, &election, &result_socket);
+            process_orders_batch_as_leader(
+                node_id,
+                &orders,
+                &election,
+                &result_pub,
+            );
         }
     }
 }
@@ -105,7 +177,7 @@ fn process_orders_batch_as_leader(
     node_id: u8,
     orders: &[Order],
     election: &LeaderElection,
-    result_socket: &UdpSocket,
+    result_pub: &AeronPublication,
 ) {
     let leader = node_name(node_id);
     let verbose = order_process::config::verbose_raft();
@@ -122,7 +194,6 @@ fn process_orders_batch_as_leader(
             } else {
                 rng.gen_range(1..=order.qty)
             };
-
             ReplicatedCommand {
                 order_id: order.order_id,
                 symbol: order.symbol.clone(),
@@ -141,7 +212,7 @@ fn process_orders_batch_as_leader(
         return;
     }
 
-    let cfg = order_process::config::config();
+    let mut idle = BusySpinIdleStrategy::default();
     for committed in committed_batch {
         let result = json!({
             "order_id": committed.order_id,
@@ -154,22 +225,29 @@ fn process_orders_batch_as_leader(
             "term": committed.term,
         });
 
-        if let Ok(buf) = serde_json::to_vec(&result) {
-            let _ = result_socket.send_to(&buf, (cfg.s3_host.as_str(), cfg.s3_port));
+        let line = result.to_string();
+        let payload = line.as_bytes();
+
+        // Offer to S3 with backpressure retry
+        loop {
+            match result_pub.offer(payload) {
+                Ok(_) => break,
+                Err(e) if e.is_retryable() => {
+                    idle.idle(0);
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("[order-process] result publish error: {e}");
+                    break;
+                }
+            }
         }
 
         if verbose {
-            let line = result.to_string();
             println!(
-                "[order] {} LEADER committed order_id={} status={} filled={}/{} -> S3 {}:{} {}",
-                leader,
-                committed.order_id,
-                committed.status,
-                committed.filled_qty,
-                committed.qty,
-                cfg.s3_host,
-                cfg.s3_port,
-                line
+                "[order] {} LEADER committed order_id={} status={} filled={}/{}",
+                leader, committed.order_id, committed.status,
+                committed.filled_qty, committed.qty,
             );
         }
     }
