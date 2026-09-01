@@ -194,17 +194,38 @@ fn main() {
 
     // ── Publisher thread: drains channel → offers to all Aeron publications ────
     // Single thread owns all AeronExclusivePublication (not Send/Sync).
+    //
+    // A node with no live subscriber reports back pressure as `NotConnected`,
+    // which `is_retryable()` correctly treats as retryable (a subscriber may
+    // join later) — but retrying it unboundedly here would let one dead node
+    // freeze the publisher thread forever, and with it the bounded channel and
+    // every generator thread behind it. Skip a not-yet-connected publication
+    // for this message instead of blocking; it catches up once connected.
+    // Genuine back pressure from an already-connected node still retries, capped
+    // as a safety net in case a node drops mid-stream.
+    const MAX_BACKPRESSURE_RETRIES: u32 = 100_000;
     let mut idle = BusySpinIdleStrategy::default();
     loop {
         match payload_rx.recv() {
             Ok(payload) => {
                 let payload_bytes = payload.as_bytes();
                 for pub_ in &publications {
+                    if !pub_.is_connected() {
+                        continue;
+                    }
+                    let mut retries = 0u32;
                     loop {
                         match pub_.offer(payload_bytes) {
                             Ok(_) => break,
-                            Err(e) if e.is_retryable() => { idle.idle(0); continue; }
-                            Err(e) => { eprintln!("[order-sending] publish error: {e}"); break; }
+                            Err(e) if e.is_retryable() && retries < MAX_BACKPRESSURE_RETRIES => {
+                                retries += 1;
+                                idle.idle(0);
+                                continue;
+                            }
+                            Err(e) => {
+                                eprintln!("[order-sending] publish error: {e}");
+                                break;
+                            }
                         }
                     }
                 }
