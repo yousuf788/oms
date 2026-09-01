@@ -34,8 +34,12 @@ set +a
 # ── 2. System packages (libuuid, libbsd, JRE for Aeron) ─────────────────────
 missing_pkgs=()
 command -v java >/dev/null 2>&1 || missing_pkgs+=(default-jre-headless)
-ldconfig -p 2>/dev/null | grep -q libuuid.so || missing_pkgs+=(libuuid1)
-ldconfig -p 2>/dev/null | grep -q libbsd.so  || missing_pkgs+=(libbsd0)
+# NOTE: use command substitution, not `| grep -q`, to check these — under
+# `pipefail`, `grep -q` exits as soon as it finds a match and closes its end
+# of the pipe, which can make the still-writing `ldconfig` process die from
+# SIGPIPE and report a false failure even though the library is present.
+[[ -n "$(ldconfig -p 2>/dev/null | grep libuuid.so)" ]] || missing_pkgs+=(libuuid1)
+[[ -n "$(ldconfig -p 2>/dev/null | grep libbsd.so)"  ]] || missing_pkgs+=(libbsd0)
 
 if [[ ${#missing_pkgs[@]} -gt 0 ]]; then
   if command -v apt-get >/dev/null 2>&1; then
@@ -74,14 +78,13 @@ fi
 
 # ── 5. Aeron Media Driver ────────────────────────────────────────────────────
 export AERON_DIR="${AERON_DIR:-/dev/shm/aeron-$(id -u)}"
+# Check for a LIVE MediaDriver process bound to this AERON_DIR — not just the
+# presence of cnc.dat, which is a memory-mapped file that survives on disk
+# after the driver that created it has been killed (stale state otherwise
+# makes this think a dead driver is still running, and the app then times out
+# trying to connect to it).
 driver_running=false
-if [[ -f "$REPO_ROOT/scripts/media-driver.pid" ]]; then
-  pid="$(cat "$REPO_ROOT/scripts/media-driver.pid" 2>/dev/null || true)"
-  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-    driver_running=true
-  fi
-fi
-if [[ "$driver_running" == false ]] && [[ -f "$AERON_DIR/cnc.dat" ]]; then
+if pgrep -f "Daeron\.dir=${AERON_DIR}[^[:space:]]*.*MediaDriver" >/dev/null 2>&1; then
   driver_running=true
 fi
 
