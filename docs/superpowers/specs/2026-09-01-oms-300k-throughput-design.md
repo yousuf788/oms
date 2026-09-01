@@ -82,9 +82,27 @@ two.
 
 New: after the existing generator threads (unchanged) feed a bounded channel of `OrderWire`
 values, a fan-out stage distributes each order to **3 dedicated publisher threads**, one per S2
-node, each owning exactly one `AeronExclusivePublication` and one bounded channel, retrying
-`offer()` independently with its own `BusySpinIdleStrategy`. Backpressure on one node's channel
-no longer blocks the other two.
+node, each owning exactly one publication and one bounded channel, retrying `offer()`
+independently with its own `BusySpinIdleStrategy`. Backpressure on one node's channel no longer
+blocks the other two.
+
+**Implementation detail confirmed against `rusteron-client-0.2.5`'s generated bindings**:
+`AeronExclusivePublication` (what `order-sending` uses today, via
+`async_add_exclusive_publication`) has no `Send` impl at all — the crate's own generated
+comment states it explicitly ("the caller must still confirm the underlying Aeron object is
+thread-safe (e.g. `AeronPublication` is, `AeronExclusivePublication` is not)"), so it cannot be
+moved into a dedicated thread even once, let alone shared. `AeronPublication` (the non-exclusive
+variant — already what `order-process`/`order-receiver` use) **does** get an unconditional
+`unsafe impl Send`, with no Cargo feature flag required, specifically so a handle can be moved to
+and then used exclusively within one owning thread. This design therefore switches
+`order-sending` from `async_add_exclusive_publication` to `async_add_publication` (matching the
+other two services), creates all 3 publications up front in `main()` as today, then **moves**
+(not shares) one into each of the 3 dedicated publisher threads. `AeronPublication` exposes the
+identical `.offer()` API (same `impl_publication_methods!` macro backs both types), so no other
+call-site changes are needed. Trade-off: the C library does a small amount of extra internal
+synchronization per `offer()` on the non-exclusive type (it supports concurrent callers, even
+though we only ever use one thread per handle here) — a minor per-call cost that removing the
+single-thread head-of-line blocking across all 3 nodes should easily outweigh.
 
 ### 3. `order-process` — decoupled result delivery + right-sized replication batches
 
