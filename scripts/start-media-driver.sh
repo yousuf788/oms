@@ -26,7 +26,7 @@ fi
 export AERON_DIR="${AERON_DIR:-/dev/shm/aeron-$(id -u)}"
 mkdir -p "$AERON_DIR"
 
-JAVA_OPTS="-XX:+UseG1GC -Xms64m -Xmx128m"
+JAVA_OPTS="-XX:+UseG1GC -Xms64m -Xmx128m --add-opens java.base/sun.nio.ch=ALL-UNNAMED"
 DRIVER_CLASS="io.aeron.driver.MediaDriver"
 
 if [ "${1}" = "--fg" ]; then

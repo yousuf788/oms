@@ -34,11 +34,13 @@ fn now_ms() -> u128 {
 
 fn aeron_dir() -> String {
     std::env::var("AERON_DIR").unwrap_or_else(|_| {
-        // Get uid via env fallback
-        std::env::var("UID")
-            .ok()
-            .map(|uid| format!("/dev/shm/aeron-{uid}"))
-            .unwrap_or_else(|| "/dev/shm/aeron-oms".to_string())
+        #[cfg(target_os = "linux")]
+        unsafe {
+            extern "C" { fn getuid() -> u32; }
+            format!("/dev/shm/aeron-{}", getuid())
+        }
+        #[cfg(not(target_os = "linux"))]
+        "/dev/shm/aeron-0".to_string()
     })
 }
 
