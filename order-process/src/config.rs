@@ -78,7 +78,7 @@ fn load_from_env() -> ClusterConfig {
         nodes: vec![
             S2Node {
                 id: 1,
-                name: env_or("NODE1_NAME", "Vivek"),
+                name: env_or("NODE1_NAME", "Nitin"),
                 host: env_required("NODE1_HOST"),
                 raft_port: env_u16("NODE1_RAFT_PORT", 6001),
                 order_port: env_u16("NODE1_ORDER_PORT", 7001),
@@ -189,7 +189,7 @@ pub fn node_name(id: u8) -> String {
         .unwrap_or_else(|| format!("S2-{id}"))
 }
 
-/// e.g. "Vivek is not available; Amit is not available; Yousuf is LEADER"
+/// e.g. "Nitin is not available; Amit is not available; Yousuf is LEADER"
 pub fn format_role_summary(leader_id: Option<u8>, unavailable: &[u8]) -> String {
     config()
         .nodes

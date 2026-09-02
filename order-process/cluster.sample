@@ -3,8 +3,8 @@
 
 BIND_HOST=0.0.0.0
 
-# ---- Node 1 (Vivek) ----
-NODE1_NAME=Vivek
+# ---- Node 1 (Nitin) ----
+NODE1_NAME=Nitin
 NODE1_HOST=172.16.12.104
 NODE1_RAFT_PORT=6001
 NODE1_ORDER_PORT=7001
