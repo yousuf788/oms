@@ -13,11 +13,17 @@ use corroboration::start_corroboration_responder;
 use health_poll::start_health_poller;
 
 fn main() {
+    println!("[order-witness] === STEP 1: Loading Configuration & Validating HMAC Key ===");
     let cfg = init_config();
     // Eagerly load WITNESS_HMAC_KEY — panics with a clear message if not set.
     let _ = auth::witness_key();
+    println!("[order-witness] WITNESS_HMAC_KEY successfully validated");
+
     println!(
-        "[witness] starting — watching: {}",
+        "[order-witness] === STEP 2: Starting Health Polling Engine for Watched S2 Nodes ==="
+    );
+    println!(
+        "[order-witness] Watching endpoints: {}",
         cfg.nodes
             .iter()
             .map(|n| format!("{} ({}:{})", n.name, n.host, n.health_port))
@@ -26,5 +32,10 @@ fn main() {
     );
 
     let table = start_health_poller();
+
+    println!(
+        "[order-witness] === STEP 3: Binding UDP Corroboration Listener on Port {} ===",
+        cfg.witness_port
+    );
     start_corroboration_responder(table); // blocks forever on the main thread
 }

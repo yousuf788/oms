@@ -61,9 +61,14 @@ fn aeron_dir() -> String {
 }
 
 fn main() {
+    println!("[order-receiver] === STEP 1: Loading Receiver Configuration ===");
     let cfg = init_config();
+    println!(
+        "[order-receiver] Config initialized — Bind Host: {}, S3 Port: {}",
+        cfg.bind_host, cfg.bind_port
+    );
 
-    // ── Connect to Aeron Media Driver ──────────────────────────────────────────
+    println!("[order-receiver] === STEP 2: Connecting to Aeron Media Driver ===");
     let aeron_dir_path = aeron_dir();
     println!("[order-receiver] connecting to Aeron Media Driver at {aeron_dir_path}");
 
@@ -76,9 +81,9 @@ fn main() {
 
     let aeron = Aeron::new(&ctx).expect("Aeron client");
     aeron.start().expect("start aeron client");
+    println!("[order-receiver] Aeron client successfully connected to media driver");
 
-    // ── Subscribe to result channel ────────────────────────────────────────────
-    // S2 leader publishes to our host:port, so we subscribe on our own endpoint.
+    println!("[order-receiver] === STEP 3: Subscribing to Aeron Result Channel ===");
     let channel = format!("aeron:udp?endpoint={}:{}", cfg.bind_host, cfg.bind_port);
     println!(
         "[order-receiver] subscribing on {channel} stream {RESULT_STREAM_ID}, writing to {}",
@@ -95,11 +100,9 @@ fn main() {
         .expect("async_add_subscription")
         .poll_blocking(Duration::from_secs(10))
         .expect("subscription ready");
+    println!("[order-receiver] result channel subscription ACTIVE on stream {RESULT_STREAM_ID}");
 
-    // ── Background log writer (buffers text lines, flushed on 64KB or 50ms
-    // idle) — the receiver previously opened, wrote, and flushed the log
-    // file on every single message, which was the actual throughput ceiling
-    // for this service. This mirrors order-sending's writer thread. ──────────
+    println!("[order-receiver] === STEP 4: Starting Log Writer & Throughput Monitor ===");
     let (log_tx, log_rx) = mpsc::sync_channel::<String>(1_000_000);
     {
         let path = received_log_path();
@@ -130,8 +133,6 @@ fn main() {
         });
     }
 
-    // ── Stats thread (replaces the old per-message println!, which at high
-    // throughput would itself become a bottleneck via stdout's internal lock) ─
     let received_total = Arc::new(AtomicU64::new(0));
     {
         let received_total = Arc::clone(&received_total);
@@ -146,7 +147,7 @@ fn main() {
         });
     }
 
-    // ── Poll loop ──────────────────────────────────────────────────────────────
+    println!("[order-receiver] === STEP 5: Entering Poll Loop for Inbound Result Stream ===");
     let mut seen_order_ids: HashSet<u64> = HashSet::new();
     let mut idle = BackoffIdleStrategy::new();
 

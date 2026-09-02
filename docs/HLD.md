@@ -37,7 +37,7 @@ The OMS is split into three tiers running across three physical machines:
           │              └──────────────────────────────┘
           │
           └──────────────────────────────────────────────────────────────►
-                          SERVER 3 (172.16.13.181)
+                          SERVER 3 (10.10.0.56)
                         ┌──────────────────────────────┐
                         │ order-process Node 2          │
                         │ [Raft FOLLOWER — standby]    │
@@ -87,7 +87,7 @@ Rust service → [shared memory] → Aeron Media Driver → [UDP] → Aeron Medi
 order-sending (Server 1)
     │
     ├─ Publication → aeron:udp?endpoint=172.16.12.104:7001 [Stream 1001] → Node 1 (Server 2)
-    ├─ Publication → aeron:udp?endpoint=172.16.13.181:7002 [Stream 1001] → Node 2 (Server 3)
+    ├─ Publication → aeron:udp?endpoint=10.10.0.56:7002 [Stream 1001] → Node 2 (Server 3)
     └─ Publication → aeron:udp?endpoint=10.10.1.69:7003 [Stream 1001] → Node 3 (Server 1)
 ```
 
@@ -143,7 +143,7 @@ Step 2: Leader writes entries to its Write-Ahead Log (WAL)
 
 Step 3: Leader replicates entries to followers via Raft AppendEntries (UDP)
         Server 1 → Server 2  (172.16.12.104:6001)
-        Server 1 → Server 3  (172.16.13.181:6002)
+        Server 1 → Server 3  (10.10.0.56:6002)
 
 Step 4: Followers write to their WALs and send AppendAck back
 

@@ -64,6 +64,7 @@ fn aeron_dir() -> String {
 }
 
 fn main() {
+    println!("[order-process] === STEP 1: Loading Configuration & Resolving Node ID ===");
     let cfg = init_config();
     let node_id = resolve_node_id();
     if !(1..=3).contains(&node_id) {
@@ -71,10 +72,19 @@ fn main() {
     }
 
     let self_node = find_node(node_id).expect("unknown NODE_ID");
+    println!(
+        "[order-process] Config initialized for Node ID {} ({}) — Host: {}, Raft Port: {}, Order Port: {}, Health Port: {}",
+        node_id, self_node.name, self_node.host, self_node.raft_port, self_node.order_port, self_node.health_port
+    );
 
+    println!("[order-process] === STEP 2: Starting Witness Health Probe Responder ===");
     // Trivial liveness responder for the witness service — independent of Aeron
     // and the Raft control channel, so it comes up even before either does.
     start_health_responder(node_id, &cfg.bind_host, self_node.health_port);
+    println!(
+        "[health-probe] UDP liveness responder listening on {}:{}",
+        cfg.bind_host, self_node.health_port
+    );
 
     println!(
         "[role] {} (S2-{}) starting — peers: {}",
@@ -87,7 +97,7 @@ fn main() {
             .join(", ")
     );
 
-    // ── Connect to Aeron Media Driver ──────────────────────────────────────────
+    println!("[order-process] === STEP 3: Connecting to Aeron Media Driver ===");
     let aeron_dir_path = aeron_dir();
     println!("[order-process] connecting to Aeron Media Driver at {aeron_dir_path}");
 
@@ -100,8 +110,9 @@ fn main() {
 
     let aeron = Aeron::new(&ctx).expect("Aeron client");
     aeron.start().expect("start aeron client");
+    println!("[order-process] Aeron client successfully connected to media driver");
 
-    // ── Subscribe to order channel ─────────────────────────────────────────────
+    println!("[order-process] === STEP 4: Initializing Aeron Order Subscription & Result Publication ===");
     // Each S2 node subscribes on its own host:order_port.
     // S1 (order-sending) publishes to each of these unicast endpoints.
     let order_channel = format!(
@@ -122,8 +133,8 @@ fn main() {
         .expect("async_add_subscription (orders)")
         .poll_blocking(Duration::from_secs(10))
         .expect("order subscription ready");
+    println!("[order-process] order channel subscription ACTIVE on stream {ORDER_STREAM_ID}");
 
-    // ── Publication to order-receiver (S3) ────────────────────────────────────
     // All 3 nodes create this publication. Only the active leader calls offer().
     let result_channel = format!("aeron:udp?endpoint={}:{}", cfg.s3_host, cfg.s3_port);
     println!(
@@ -135,20 +146,15 @@ fn main() {
         .expect("async_add_publication (results)")
         .poll_blocking(Duration::from_secs(10))
         .expect("result publication ready");
+    println!("[order-process] result channel publication ACTIVE on stream {RESULT_STREAM_ID}");
 
-    // ── Start Raft election ────────────────────────────────────────────────────
-    // LeaderElection takes ownership of result_pub and moves it into its own
-    // background publisher thread — S3 delivery is decoupled entirely from
-    // this main loop (see leader_election.rs::result_publisher_loop), which
-    // fixes a bug where a committed batch's result was silently dropped if
-    // propose_batch()'s 1500ms wait timed out before delivery.
+    println!("[order-process] === STEP 5: Starting Raft Consensus Engine ===");
     let election = LeaderElection::start(node_id, result_pub);
 
-    // ── Shared lock-free channel for orders ────────────────────────────────────
+    println!("[order-process] === STEP 6: Spawning Order Ingress Polling Thread & Hot Loop ===");
     // Bounded channel to apply backpressure if processing is slower than Aeron delivery
     let (order_tx, order_rx) = crossbeam_channel::bounded::<OrderWire>(500_000);
 
-    // ── Polling Thread: Aggressively drain Aeron ───────────────────────────────
     let poll_tx = order_tx.clone();
     thread::spawn(move || {
         let mut idle = BackoffIdleStrategy::new();
@@ -168,7 +174,7 @@ fn main() {
                             Err(_) => {}
                         },
                         None if verbose => eprintln!(
-                            "[order-process] dropped order packet ({} bytes): HMAC failure",
+                            "[order-process] dropped order packet ({} bytes): HMAC failure — check CLUSTER_HMAC_KEY in .env",
                             buf.len()
                         ),
                         None => {}
@@ -179,11 +185,11 @@ fn main() {
         }
     });
 
-    // ── Main processing loop ───────────────────────────────────────────────────
     let mut last_role_line = String::new();
     let mut batch = Vec::with_capacity(20_000);
     let mut seen_ids = HashSet::with_capacity(20_000);
 
+    println!("[order-process] READY — entering main order batching & consensus loop...");
     loop {
         let line = election.role_summary();
         if line != last_role_line {

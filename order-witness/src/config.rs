@@ -10,7 +10,7 @@ pub struct WatchedNodeAddr {
 }
 
 impl WatchedNodeAddr {
-    /// e.g. "Amit (172.16.13.181)" — used everywhere a log line would
+    /// e.g. "Amit (10.10.0.56)" — used everywhere a log line would
     /// otherwise print a bare node id.
     pub fn label(&self) -> String {
         format!("{} ({})", self.name, self.host)
@@ -116,7 +116,7 @@ pub fn other_nodes(requester_id: u8) -> Vec<WatchedNodeAddr> {
 }
 
 /// Looks up a single configured node by id — used to label a requester
-/// (e.g. "Amit (172.16.13.181)") in logs instead of a bare node id.
+/// (e.g. "Amit (10.10.0.56)") in logs instead of a bare node id.
 pub fn find_node(id: u8) -> Option<WatchedNodeAddr> {
     config().nodes.iter().find(|n| n.id == id).cloned()
 }

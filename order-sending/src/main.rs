@@ -66,6 +66,7 @@ fn aeron_dir() -> String {
 }
 
 fn main() {
+    println!("[order-sending] === STEP 1: Loading Configuration & Pacing Parameters ===");
     let cfg = init_config();
 
     let target_tps: u64 = std::env::var("TARGET_TPS")
@@ -74,10 +75,17 @@ fn main() {
         .ok().and_then(|v| v.parse().ok()).unwrap_or(8);
     let channel_capacity = target_tps.max(10000) as usize;
 
+    println!(
+        "[order-sending] Target TPS: {}, Generator Threads: {}, Channel Capacity: {}",
+        target_tps, num_gen_threads, channel_capacity
+    );
+
+    println!("[order-sending] === STEP 2: Verifying CLUSTER_HMAC_KEY Security Configuration ===");
     // Eagerly load the key at startup so we panic early if CLUSTER_HMAC_KEY is missing.
     let _ = auth::cluster_key();
+    println!("[order-sending] CLUSTER_HMAC_KEY successfully validated");
 
-    // ── Connect to Aeron Media Driver ──────────────────────────────────────────
+    println!("[order-sending] === STEP 3: Connecting to Aeron Media Driver ===");
     let aeron_dir_path = aeron_dir();
     println!("[order-sending] connecting to Aeron Media Driver at {aeron_dir_path}");
 
@@ -90,12 +98,13 @@ fn main() {
 
     let aeron = Aeron::new(&ctx).expect("Aeron client");
     aeron.start().expect("start aeron client");
+    println!("[order-sending] Aeron client successfully connected to media driver");
 
     // ── Shared counters ────────────────────────────────────────────────────────
     let order_counter = Arc::new(AtomicU64::new(1));
     let sent_total = Arc::new(AtomicU64::new(0));
 
-    // ── Background log writer (buffers order_ids, flushed on 64KB or 50ms idle) ─
+    println!("[order-sending] === STEP 4: Starting Background Log Writer & Throughput Stats Thread ===");
     let (log_tx, log_rx) = mpsc::sync_channel::<u64>(1_000_000);
     {
         let path = sent_log_path();
@@ -126,7 +135,6 @@ fn main() {
         });
     }
 
-    // ── Stats thread ───────────────────────────────────────────────────────────
     {
         let sent_total = Arc::clone(&sent_total);
         thread::spawn(move || {
@@ -139,6 +147,8 @@ fn main() {
             }
         });
     }
+
+    println!("[order-sending] === STEP 5: Initializing Per-Node Unicast Aeron Publications ===");
 
     // ── Create Aeron publications — one per S2 node (unicast). Non-exclusive
     // (AeronPublication, not AeronExclusivePublication) because only the
