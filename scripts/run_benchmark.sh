@@ -18,7 +18,7 @@ mkdir -p "$BENCH_DIR/receiver_logs" "$BENCH_DIR/sending_logs" "$BENCH_DIR/wal_da
 # Common localhost configuration
 export BIND_HOST="127.0.0.1"
 export NODE1_HOST="127.0.0.1"
-export NODE1_NAME="Vivek"
+export NODE1_NAME="Nitin"
 export NODE1_RAFT_PORT="16001"
 export NODE1_ORDER_PORT="17001"
 

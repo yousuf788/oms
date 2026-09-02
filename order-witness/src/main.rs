@@ -17,7 +17,7 @@ fn main() {
         "[witness] starting — watching: {}",
         cfg.nodes
             .iter()
-            .map(|n| format!("node{}={}:{}", n.id, n.host, n.health_port))
+            .map(|n| format!("{} ({}:{})", n.name, n.host, n.health_port))
             .collect::<Vec<_>>()
             .join(", ")
     );

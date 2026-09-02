@@ -9,7 +9,7 @@ raw-UDP baseline). The goal of this project is to **prove** — as a bounded ben
 a permanent production duty cycle — that the pipeline can sustain 300,000 orders/sec on all
 three legs (sent, processed, received) with zero data loss (sent count == processed count ==
 received count), on the real 3-machine lab deployment described in `docs/HLD.md`
-(Vivek / Amit / Yousuf), while keeping 3-node Raft consensus and WAL durability.
+(Nitin / Amit / Yousuf), while keeping 3-node Raft consensus and WAL durability.
 
 Constraints established during design:
 - **Topology**: real 3-physical-machine lab deployment, not the single-machine benchmark script.
@@ -152,7 +152,7 @@ scope (a bounded benchmark run, not an indefinite process — see Context).
 
 - Extend the existing `scripts/run_benchmark.sh` pattern (currently single-machine-only, with its
   own isolated ports/config) into per-role launch steps that can run against the real `.env` on
-  each of Vivek/Amit/Yousuf: `order-sending` driven with `TARGET_TPS=300000` and enough
+  each of Nitin/Amit/Yousuf: `order-sending` driven with `TARGET_TPS=300000` and enough
   `SENDER_THREADS`, `order-process` started via the existing `starter.sh` on each of the 3
   machines, `order-receiver` on Yousuf.
 - Success criterion: total sent == total processed == total received, sustained at ~300,000/sec
