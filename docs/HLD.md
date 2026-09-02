@@ -13,7 +13,7 @@ The OMS is split into three tiers running across three physical machines:
 
 ```
 ┌────────────────────────────────────────────────────────────────────────┐
-│                       SERVER 1 (172.16.12.252)                         │
+│                       SERVER 1 (10.10.1.69)                         │
 │                                                                        │
 │   ┌─────────────┐   Aeron UDP    ┌──────────────────────────────────┐  │
 │   │ order-      │ ─────────────► │ order-process  Node 3 (Server 1) │  │
@@ -88,7 +88,7 @@ order-sending (Server 1)
     │
     ├─ Publication → aeron:udp?endpoint=172.16.12.104:7001 [Stream 1001] → Node 1 (Server 2)
     ├─ Publication → aeron:udp?endpoint=172.16.13.181:7002 [Stream 1001] → Node 2 (Server 3)
-    └─ Publication → aeron:udp?endpoint=172.16.12.252:7003 [Stream 1001] → Node 3 (Server 1)
+    └─ Publication → aeron:udp?endpoint=10.10.1.69:7003 [Stream 1001] → Node 3 (Server 1)
 ```
 
 **Why unicast (not multicast)?**
@@ -124,7 +124,7 @@ All 3 S2 nodes have an **Aeron publication pointing to S3** on Server 1. Only th
 
 ```
 S2 Leader (any node)
-    └─ Publication → aeron:udp?endpoint=172.16.12.252:8001 [Stream 2001] → order-receiver (S3)
+    └─ Publication → aeron:udp?endpoint=10.10.1.69:8001 [Stream 2001] → order-receiver (S3)
 ```
 
 ---
@@ -326,7 +326,7 @@ order-process node (locally isolated, PEER_SILENT_MS elapsed)
 
 ```
                         ┌──────────────────────────────────────────────┐
-                        │               SERVER 1 (172.16.12.252)       │
+                        │               SERVER 1 (10.10.1.69)       │
                         │                                              │
   ┌──────────────┐      │  ┌───────────────────────────────────────┐   │
   │  Orders      │      │  │         Aeron Media Driver            │   │
@@ -389,7 +389,7 @@ order-process node (locally isolated, PEER_SILENT_MS elapsed)
 | `WITNESS_HOST` / `WITNESS_PORT` | — / 9101 | Address of the `order-witness` service |
 | `WITNESS_TIMEOUT_MS` | 1500ms | Max wait for witness corroboration before staying passive |
 | `NODE1/2/3_HEALTH_PORT` | 6101/6102/6103 | Liveness-probe ports the witness pings (separate from Raft) |
-| `TARGET_TPS` | 5000 | Orders per second sent by order-sending |
+| `TARGET_TPS` | 5000 (default), 300000 in order-sending/.env | Orders per second sent by order-sending — see `scripts/run_lab_benchmark.md` |
 | Aeron Order Stream | 1001 | Logical stream ID for order messages |
 | Aeron Result Stream | 2001 | Logical stream ID for result messages |
 

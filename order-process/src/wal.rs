@@ -22,6 +22,39 @@ pub struct LogEntry {
     pub command: ReplicatedCommand,
 }
 
+/// Encodes `entry` as `bincode` and appends it to `buf` behind a 4-byte
+/// little-endian length prefix, so multiple records can be concatenated in
+/// one file and read back without a text delimiter (binary data isn't safely
+/// newline-delimited the way the old JSON-lines format was).
+fn write_framed_entry(buf: &mut Vec<u8>, entry: &LogEntry) -> io::Result<()> {
+    let encoded = bincode::serialize(entry)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    buf.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&encoded);
+    Ok(())
+}
+
+/// Reads as many complete length-prefixed records as `bytes` contains. Stops
+/// (without erroring) at a truncated trailing record — e.g. a length header
+/// with no body yet, from a process killed mid-write — since the WAL's
+/// durability model is OS-buffered writes, not fsync'd transactions.
+fn read_framed_entries(bytes: &[u8]) -> Vec<LogEntry> {
+    let mut entries = Vec::new();
+    let mut pos = 0usize;
+    while pos + 4 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + len > bytes.len() {
+            break;
+        }
+        if let Ok(entry) = bincode::deserialize::<LogEntry>(&bytes[pos..pos + len]) {
+            entries.push(entry);
+        }
+        pos += len;
+    }
+    entries
+}
+
 pub struct Wal {
     path: PathBuf,
     file: fs::File,
@@ -60,38 +93,30 @@ impl Wal {
         if !path.exists() {
             return Ok(Vec::new());
         }
-        let mut entries = Vec::new();
-        let content = fs::read_to_string(path)?;
-        for line in content.lines() {
-            if let Ok(entry) = serde_json::from_str::<LogEntry>(line) {
-                entries.push(entry);
-            }
-        }
+        let bytes = fs::read(path)?;
+        let mut entries = read_framed_entries(&bytes);
         entries.sort_by_key(|entry| entry.index);
         Ok(entries)
     }
 
     fn append_single_entry(&mut self, entry: &LogEntry) -> io::Result<()> {
-        let line = serde_json::to_string(entry)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-        writeln!(self.file, "{line}")?;
+        let mut buf = Vec::new();
+        write_framed_entry(&mut buf, entry)?;
+        self.file.write_all(&buf)?;
         Ok(())
     }
 
     fn rewrite_all(&mut self) -> io::Result<()> {
-        let mut out = String::new();
+        let mut buf = Vec::new();
         for entry in &self.entries {
-            let line = serde_json::to_string(entry)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-            out.push_str(&line);
-            out.push('\n');
+            write_framed_entry(&mut buf, entry)?;
         }
         let mut file = OpenOptions::new()
             .create(true)
             .write(true)
             .truncate(true)
             .open(&self.path)?;
-        file.write_all(out.as_bytes())?;
+        file.write_all(&buf)?;
         file.flush()?;
         self.file = OpenOptions::new()
             .create(true)
@@ -174,7 +199,7 @@ impl Wal {
         commands: Vec<ReplicatedCommand>,
     ) -> io::Result<Vec<LogEntry>> {
         let mut entries = Vec::with_capacity(commands.len());
-        let mut out = String::with_capacity(commands.len() * 150);
+        let mut buf = Vec::with_capacity(commands.len() * 96);
         let mut last_idx = self.last_index();
         for command in commands {
             last_idx += 1;
@@ -183,13 +208,10 @@ impl Wal {
                 term,
                 command,
             };
-            let line = serde_json::to_string(&entry)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-            out.push_str(&line);
-            out.push('\n');
-            entries.push(entry.clone());
+            write_framed_entry(&mut buf, &entry)?;
+            entries.push(entry);
         }
-        self.file.write_all(out.as_bytes())?;
+        self.file.write_all(&buf)?;
         self.entries.extend(entries.clone());
         Ok(entries)
     }
@@ -226,5 +248,52 @@ impl Wal {
             self.rewrite_all()?;
         }
         Ok(Some(self.last_index()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_entry(index: u64) -> LogEntry {
+        LogEntry {
+            index,
+            term: 1,
+            command: ReplicatedCommand {
+                order_id: index,
+                symbol: "BTC-USDT".to_string(),
+                side: "BUY".to_string(),
+                qty: 5,
+                status: "FILLED".to_string(),
+                filled_qty: 5,
+                processed_by: "Nitin (S2-1)".to_string(),
+                term: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn framed_entries_round_trip() {
+        let mut buf = Vec::new();
+        write_framed_entry(&mut buf, &sample_entry(7)).unwrap();
+        write_framed_entry(&mut buf, &sample_entry(8)).unwrap();
+
+        let decoded = read_framed_entries(&buf);
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].index, 7);
+        assert_eq!(decoded[0].command.order_id, 7);
+        assert_eq!(decoded[1].index, 8);
+    }
+
+    #[test]
+    fn read_framed_entries_stops_at_truncated_trailing_record() {
+        let mut buf = Vec::new();
+        write_framed_entry(&mut buf, &sample_entry(1)).unwrap();
+        buf.extend_from_slice(&999u32.to_le_bytes());
+
+        let decoded = read_framed_entries(&buf);
+
+        assert_eq!(decoded.len(), 1, "must not panic or return garbage for a truncated trailing record");
     }
 }

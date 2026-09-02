@@ -7,6 +7,7 @@ use crate::config::{
 use crate::wal::{LogEntry, ReplicatedCommand, Wal};
 use crate::witness_client::{CachedVerdict, CorroborationOutcome, WitnessClient};
 use rand::Rng;
+use rusteron_client::{AeronPublication, BusySpinIdleStrategy, IdleStrategy};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, UdpSocket};
@@ -15,11 +16,54 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Keep AppendEntries UDP packets small enough to avoid excessive fragmentation, 
-/// but large enough to support 200k TPS batching. With 10,000 entries, the payload
-/// might be ~1.5MB, so we must increase the UDP receive buffer.
-const MAX_ENTRIES_PER_APPEND: usize = 10_000;
+/// Byte budget for a single `AppendEntries` UDP datagram, sized to stay
+/// safely under standard Ethernet MTU (1500 bytes) after IP/UDP headers, so
+/// replication never silently depends on IP fragmentation (a single lost
+/// fragment loses the whole datagram).
+const APPEND_BATCH_BYTE_BUDGET: usize = 1400;
 const RECV_BUF_SIZE: usize = 2_000_000;
+
+/// Takes as many `entries` (in order) as fit within `budget_bytes` once
+/// bincode-encoded, always taking at least one entry even if it alone
+/// exceeds the budget, so replication keeps making progress regardless of
+/// how large a single command's payload gets.
+fn entries_within_budget(entries: Vec<LogEntry>, budget_bytes: usize) -> Vec<LogEntry> {
+    let mut taken = Vec::new();
+    let mut total = 0usize;
+    for entry in entries {
+        let size = bincode::serialized_size(&entry).unwrap_or(0) as usize;
+        if !taken.is_empty() && total + size > budget_bytes {
+            break;
+        }
+        total += size;
+        taken.push(entry);
+    }
+    taken
+}
+
+/// Binds a UDP socket for the Raft control channel with larger send/receive
+/// buffers than the OS default — at high replication rates this raw socket
+/// has no other flow control, so an undersized OS buffer is a real loss point.
+fn bind_tuned_udp_socket(bind_host: &str, port: u16) -> UdpSocket {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::ToSocketAddrs;
+
+    let addr: std::net::SocketAddr = (bind_host, port)
+        .to_socket_addrs()
+        .expect("resolve raft control bind address")
+        .next()
+        .expect("no address for raft control bind host/port");
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
+        .expect("create raft control socket");
+    socket
+        .set_recv_buffer_size(8 * 1024 * 1024)
+        .expect("set SO_RCVBUF on raft control socket");
+    socket
+        .set_send_buffer_size(8 * 1024 * 1024)
+        .expect("set SO_SNDBUF on raft control socket");
+    socket.bind(&addr.into()).expect("bind raft control socket");
+    socket.into()
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Role {
@@ -29,7 +73,6 @@ pub enum Role {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
-#[serde(tag = "type")]
 enum Message {
     RequestVote {
         term: u64,
@@ -109,7 +152,7 @@ impl LeaderElection {
     /// Binds the control-channel socket and spawns the background
     /// recv + election/heartbeat ticker threads. Returns immediately;
     /// call `.is_leader()` from anywhere to check current status.
-    pub fn start(self_id: u8) -> Arc<Self> {
+    pub fn start(self_id: u8, result_pub: AeronPublication) -> Arc<Self> {
         let self_node = find_node(self_id).expect("unknown node id");
         let peers: Vec<S2Node> = s2_nodes()
             .iter()
@@ -125,8 +168,7 @@ impl LeaderElection {
         let peer_available: HashMap<u8, bool> = peers.iter().map(|p| (p.id, false)).collect();
 
         let bind_host = crate::config::config().bind_host.as_str();
-        let socket = UdpSocket::bind((bind_host, self_node.raft_port))
-            .expect("failed to bind control channel");
+        let socket = bind_tuned_udp_socket(bind_host, self_node.raft_port);
         let wal = Wal::new(self_id).expect("failed to open replicated WAL");
 
         // Build the IP allowlist from configured peer host strings.
@@ -190,7 +232,87 @@ impl LeaderElection {
         let witness_handle = Arc::clone(&election);
         thread::spawn(move || witness_handle.witness_loop());
 
+        let publish_handle = Arc::clone(&election);
+        thread::spawn(move || publish_handle.result_publisher_loop(result_pub));
+
         election
+    }
+
+    /// Watches `last_applied` and streams each newly-committed entry's result
+    /// to S3 as soon as it commits, independent of which (if any)
+    /// `propose_batch()` call originally proposed it. This is what fixes the
+    /// bug where `propose_batch()`'s bounded wait timing out used to mean the
+    /// result for that specific batch was never sent to S3, even though the
+    /// entry was already correctly committed in the WAL.
+    ///
+    /// Only publishes while this node holds leadership. On losing leadership
+    /// the watermark fast-forwards to the current `last_applied` (not reset
+    /// to 0), so a later re-election doesn't republish old history it
+    /// already sent in an earlier tenure.
+    ///
+    /// Note: `last_published` starts at 0 for a freshly started process. If
+    /// this node's on-disk WAL already contains committed entries from a
+    /// previous run the first time it becomes leader in this process's
+    /// lifetime, those get republished once. This is harmless — order-receiver
+    /// already deduplicates by `order_id` — and is accepted as simpler than
+    /// tracking a persisted publish watermark across restarts, which this
+    /// benchmark-proof scope doesn't need.
+    fn result_publisher_loop(&self, result_pub: AeronPublication) {
+        let mut idle = BusySpinIdleStrategy::default();
+        let mut last_published: u64 = 0;
+        loop {
+            if !self.is_leader() {
+                let last_applied = self.state.lock().unwrap().last_applied;
+                last_published = last_applied;
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+
+            let last_applied = self.state.lock().unwrap().last_applied;
+            if last_published >= last_applied {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+
+            let next = last_published + 1;
+            let entry = { self.wal.lock().unwrap().entry_at(next) };
+            match entry {
+                Some(entry) => {
+                    if let Ok(bytes) = bincode::serialize(&entry.command) {
+                        loop {
+                            match result_pub.offer(&bytes) {
+                                Ok(_) => break,
+                                Err(e) if e.is_retryable() => {
+                                    idle.idle(0);
+                                    continue;
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[S2-{}] result publish error: {e}",
+                                        self.self_id
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        if verbose_raft() {
+                            println!(
+                                "[order] {} LEADER committed order_id={} status={} filled={}/{}",
+                                node_name(self.self_id), entry.command.order_id,
+                                entry.command.status, entry.command.filled_qty,
+                                entry.command.qty,
+                            );
+                        }
+                    }
+                    last_published = next;
+                }
+                None => {
+                    // Not yet visible in this thread's WAL snapshot (race
+                    // with the writer) - retry shortly rather than skipping.
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
     }
 
     pub fn is_leader(&self) -> bool {
@@ -339,7 +461,7 @@ impl LeaderElection {
     }
 
     fn send(&self, peer: &S2Node, msg: &Message) {
-        if let Ok(buf) = serde_json::to_vec(msg) {
+        if let Ok(buf) = bincode::serialize(msg) {
             // Sign every outbound Raft control message with CLUSTER_HMAC_KEY.
             // recv_loop on the peer side verifies this before handle_message().
             let frame = auth::sign(&buf);
@@ -585,10 +707,7 @@ impl LeaderElection {
             let prev_log_index = next_idx.saturating_sub(1);
             let prev_log_term = wal.get_term_at(prev_log_index).unwrap_or(0);
             let entries = if next_idx <= leader_last {
-                wal.entries_from(next_idx)
-                    .into_iter()
-                    .take(MAX_ENTRIES_PER_APPEND)
-                    .collect()
+                entries_within_budget(wal.entries_from(next_idx), APPEND_BATCH_BYTE_BUDGET)
             } else {
                 Vec::new()
             };
@@ -821,7 +940,7 @@ impl LeaderElection {
                 }
             };
 
-            let msg: Message = match serde_json::from_slice(payload) {
+            let msg: Message = match bincode::deserialize(payload) {
                 Ok(m) => m,
                 Err(err) => {
                     if verbose_raft() {
@@ -1088,5 +1207,49 @@ impl LeaderElection {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_entry(index: u64) -> LogEntry {
+        LogEntry {
+            index,
+            term: 1,
+            command: ReplicatedCommand {
+                order_id: index,
+                symbol: "BTC-USDT".to_string(),
+                side: "BUY".to_string(),
+                qty: 1,
+                status: "FILLED".to_string(),
+                filled_qty: 1,
+                processed_by: "Nitin (S2-1)".to_string(),
+                term: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn entries_within_budget_stops_before_exceeding_but_always_makes_progress() {
+        let entries: Vec<LogEntry> = (1..=1000).map(sample_entry).collect();
+        let one_entry_size = bincode::serialized_size(&entries[0]).unwrap() as usize;
+
+        let budget = one_entry_size * 5;
+        let batch = entries_within_budget(entries.clone(), budget);
+        assert!(!batch.is_empty());
+        assert!(
+            batch.len() <= 6,
+            "expected roughly 5 entries for a 5x-single-entry budget, got {}",
+            batch.len()
+        );
+
+        let tiny_budget = entries_within_budget(entries, 1);
+        assert_eq!(
+            tiny_budget.len(),
+            1,
+            "must always take at least one entry so replication keeps making progress"
+        );
     }
 }

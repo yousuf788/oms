@@ -15,23 +15,39 @@ use order_process::leader_election::LeaderElection;
 use order_process::wal::ReplicatedCommand;
 use rand::Rng;
 use rusteron_client::*;
-use serde::Deserialize;
-use serde_json::json;
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::ffi::CString;
-use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
 const ORDER_STREAM_ID: i32 = 1001;
 const RESULT_STREAM_ID: i32 = 2001;
 
-#[derive(Deserialize, Debug)]
-struct Order {
+/// Wire format for an inbound order from order-sending's Aeron order
+/// channel (inside the HMAC-signed frame that `auth::verify` unwraps). KEEP
+/// IN SYNC WITH order-sending/src/main.rs::OrderWire — bincode encodes
+/// struct fields positionally (by declaration order and type, not by field
+/// name), so both sides must declare identical field order and types.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+struct OrderWire {
     order_id: u64,
-    symbol: String,
-    side: String,
+    symbol: u8,
+    side: bool,
     qty: u32,
+    #[allow(dead_code)] // received for wire compatibility; not used on this side
+    ts_ms: u64,
+}
+
+const SYMBOLS: [&str; 3] = ["BTC-USDT", "ETH-USDT", "SOL-USDT"];
+
+impl OrderWire {
+    fn symbol_str(&self) -> &'static str {
+        SYMBOLS.get(self.symbol as usize).copied().unwrap_or("UNKNOWN")
+    }
+    fn side_str(&self) -> &'static str {
+        if self.side { "BUY" } else { "SELL" }
+    }
 }
 
 fn aeron_dir() -> String {
@@ -120,26 +136,42 @@ fn main() {
         .poll_blocking(Duration::from_secs(10))
         .expect("result publication ready");
 
-    let result_pub = Arc::new(result_pub);
-
     // ── Start Raft election ────────────────────────────────────────────────────
-    let election = LeaderElection::start(node_id);
+    // LeaderElection takes ownership of result_pub and moves it into its own
+    // background publisher thread — S3 delivery is decoupled entirely from
+    // this main loop (see leader_election.rs::result_publisher_loop), which
+    // fixes a bug where a committed batch's result was silently dropped if
+    // propose_batch()'s 1500ms wait timed out before delivery.
+    let election = LeaderElection::start(node_id, result_pub);
 
     // ── Shared lock-free channel for orders ────────────────────────────────────
     // Bounded channel to apply backpressure if processing is slower than Aeron delivery
-    let (order_tx, order_rx) = crossbeam_channel::bounded::<Order>(500_000);
+    let (order_tx, order_rx) = crossbeam_channel::bounded::<OrderWire>(500_000);
 
     // ── Polling Thread: Aggressively drain Aeron ───────────────────────────────
     let poll_tx = order_tx.clone();
     thread::spawn(move || {
         let mut idle = BackoffIdleStrategy::new();
         loop {
+            let verbose = order_process::config::verbose_raft();
             let fragments = order_subscription
                 .poll_fn(|buf: &[u8], _hdr: AeronHeader| {
-                    if let Some(payload) = auth::verify(buf) {
-                        if let Ok(order) = serde_json::from_slice::<Order>(payload) {
-                            let _ = poll_tx.try_send(order);
-                        }
+                    match auth::verify(buf) {
+                        Some(payload) => match bincode::deserialize::<OrderWire>(payload) {
+                            Ok(order) => {
+                                let _ = poll_tx.try_send(order);
+                            }
+                            Err(err) if verbose => eprintln!(
+                                "[order-process] dropped order ({} bytes payload): decode error: {err}",
+                                payload.len()
+                            ),
+                            Err(_) => {}
+                        },
+                        None if verbose => eprintln!(
+                            "[order-process] dropped order packet ({} bytes): HMAC failure",
+                            buf.len()
+                        ),
+                        None => {}
                     }
                 }, 5000)
                 .unwrap_or(0);
@@ -180,12 +212,7 @@ fn main() {
         }
 
         if election.is_leader() {
-            process_orders_batch_as_leader(
-                node_id,
-                &batch,
-                &election,
-                &result_pub,
-            );
+            process_orders_batch_as_leader(node_id, &batch, &election);
         } else {
             // As a follower, we just drain the channel so it doesn't back up
         }
@@ -194,12 +221,10 @@ fn main() {
 
 fn process_orders_batch_as_leader(
     node_id: u8,
-    orders: &[Order],
+    orders: &[OrderWire],
     election: &LeaderElection,
-    result_pub: &AeronPublication,
 ) {
     let leader = node_name(node_id);
-    let verbose = order_process::config::verbose_raft();
     let current_term = election.current_term();
     let outcomes = ["FILLED", "PARTIALLY_FILLED", "REJECTED"];
     let mut rng = rand::thread_rng();
@@ -215,8 +240,8 @@ fn process_orders_batch_as_leader(
             };
             ReplicatedCommand {
                 order_id: order.order_id,
-                symbol: order.symbol.clone(),
-                side: order.side.clone(),
+                symbol: order.symbol_str().to_string(),
+                side: order.side_str().to_string(),
                 qty: order.qty,
                 status: status.to_string(),
                 filled_qty,
@@ -226,48 +251,9 @@ fn process_orders_batch_as_leader(
         })
         .collect();
 
-    let committed_batch = election.propose_batch(commands);
-    if committed_batch.is_empty() {
-        return;
-    }
-
-    let mut idle = BusySpinIdleStrategy::default();
-    for committed in committed_batch {
-        let result = json!({
-            "order_id": committed.order_id,
-            "symbol": committed.symbol,
-            "side": committed.side,
-            "qty": committed.qty,
-            "status": committed.status,
-            "filled_qty": committed.filled_qty,
-            "processed_by": committed.processed_by,
-            "term": committed.term,
-        });
-
-        let line = result.to_string();
-        let payload = line.as_bytes();
-
-        // Offer to S3 with backpressure retry
-        loop {
-            match result_pub.offer(payload) {
-                Ok(_) => break,
-                Err(e) if e.is_retryable() => {
-                    idle.idle(0);
-                    continue;
-                }
-                Err(e) => {
-                    eprintln!("[order-process] result publish error: {e}");
-                    break;
-                }
-            }
-        }
-
-        if verbose {
-            println!(
-                "[order] {} LEADER committed order_id={} status={} filled={}/{}",
-                leader, committed.order_id, committed.status,
-                committed.filled_qty, committed.qty,
-            );
-        }
-    }
+    // Result delivery to S3 is handled asynchronously by LeaderElection's
+    // background publisher thread once each entry commits (see
+    // leader_election.rs::result_publisher_loop) — this call's return value
+    // is used only as a flow-control signal here, never to gate delivery.
+    election.propose_batch(commands);
 }

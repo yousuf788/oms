@@ -6,29 +6,38 @@ mod config;
 
 use config::init_config;
 use rusteron_client::*;
-use serde_json::Value;
+use serde::Deserialize;
 use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const RESULT_STREAM_ID: i32 = 2001;
 
-fn received_log_path() -> PathBuf {
-    PathBuf::from("logs").join("orders-received.log")
+/// Wire format for a committed result from order-process's Aeron result
+/// channel. KEEP IN SYNC WITH order-process/src/wal.rs::ReplicatedCommand —
+/// order-process serializes that struct directly as the wire payload, and
+/// bincode decodes positionally (by declaration order and type, not by
+/// field name), so the field order/types here must match it exactly.
+#[derive(Deserialize, Debug, Clone)]
+struct ResultWire {
+    order_id: u64,
+    symbol: String,
+    side: String,
+    qty: u32,
+    status: String,
+    filled_qty: u32,
+    processed_by: String,
+    term: u64,
 }
 
-fn append_received_log(line: &str) {
-    let path = received_log_path();
-    if let Some(parent) = path.parent() {
-        let _ = create_dir_all(parent);
-    }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(file, "{line}");
-        let _ = file.flush();
-    }
+fn received_log_path() -> PathBuf {
+    PathBuf::from("logs").join("orders-received.log")
 }
 
 fn now_ms() -> u128 {
@@ -87,6 +96,56 @@ fn main() {
         .poll_blocking(Duration::from_secs(10))
         .expect("subscription ready");
 
+    // ── Background log writer (buffers text lines, flushed on 64KB or 50ms
+    // idle) — the receiver previously opened, wrote, and flushed the log
+    // file on every single message, which was the actual throughput ceiling
+    // for this service. This mirrors order-sending's writer thread. ──────────
+    let (log_tx, log_rx) = mpsc::sync_channel::<String>(1_000_000);
+    {
+        let path = received_log_path();
+        thread::spawn(move || {
+            if let Some(parent) = path.parent() { let _ = create_dir_all(parent); }
+            let mut file = OpenOptions::new().create(true).append(true).open(&path)
+                .expect("cannot open orders-received.log");
+            let mut buf = String::with_capacity(128 * 1024);
+            loop {
+                match log_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(line) => {
+                        buf.push_str(&line); buf.push('\n');
+                        if buf.len() >= 65536 {
+                            let _ = file.write_all(buf.as_bytes());
+                            let _ = file.flush();
+                            buf.clear();
+                        }
+                    }
+                    Err(_) => {
+                        if !buf.is_empty() {
+                            let _ = file.write_all(buf.as_bytes());
+                            let _ = file.flush();
+                            buf.clear();
+                        }
+                    }
+                }
+            }
+        });
+    }
+
+    // ── Stats thread (replaces the old per-message println!, which at high
+    // throughput would itself become a bottleneck via stdout's internal lock) ─
+    let received_total = Arc::new(AtomicU64::new(0));
+    {
+        let received_total = Arc::clone(&received_total);
+        thread::spawn(move || {
+            let mut last = 0u64;
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                let now = received_total.load(Ordering::Relaxed);
+                println!("[order-receiver] throughput: {:>8} results/sec  total: {}", now - last, now);
+                last = now;
+            }
+        });
+    }
+
     // ── Poll loop ──────────────────────────────────────────────────────────────
     let mut seen_order_ids: HashSet<u64> = HashSet::new();
     let mut idle = BackoffIdleStrategy::new();
@@ -95,22 +154,19 @@ fn main() {
     loop {
         let fragments = subscription
             .poll_fn(|buf: &[u8], _hdr: AeronHeader| {
-                if let Ok(mut result) = serde_json::from_slice::<Value>(buf) {
-                    let order_id = result.get("order_id").and_then(|v| v.as_u64());
-                    if let Some(id) = order_id {
-                        if !seen_order_ids.insert(id) {
-                            return; // deduplicate
-                        }
+                if let Ok(result) = bincode::deserialize::<ResultWire>(buf) {
+                    if !seen_order_ids.insert(result.order_id) {
+                        return; // deduplicate
                     }
-                    if let Some(obj) = result.as_object_mut() {
-                        obj.insert(
-                            "received_ts_ms".to_string(),
-                            Value::Number(serde_json::Number::from(now_ms() as u64)),
-                        );
-                    }
-                    let line = result.to_string();
-                    append_received_log(&line);
-                    println!("[order-receiver] received -> {line}");
+                    let received_ts_ms = now_ms();
+                    let line = format!(
+                        "{} {} {} {} {} {} {} {} {}",
+                        result.order_id, result.symbol, result.side, result.qty,
+                        result.status, result.filled_qty, result.processed_by,
+                        result.term, received_ts_ms,
+                    );
+                    let _ = log_tx.try_send(line);
+                    received_total.fetch_add(1, Ordering::Relaxed);
                 }
             }, 256)
             .unwrap_or(0);

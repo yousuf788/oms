@@ -58,7 +58,7 @@ flowchart LR
 |---|---|---|---|
 | Nitin | `NODE1_NAME=Nitin` | `order-process` (node 1) | `172.16.12.104` |
 | Amit | `NODE2_NAME=Amit` | `order-process` (node 2) | `172.16.13.181` |
-| Yousuf | `NODE3_NAME=Yousuf` | `order-process` (node 3) + sender + receiver + `order-witness` | `172.16.12.252` |
+| Yousuf | `NODE3_NAME=Yousuf` | `order-process` (node 3) + sender + receiver + `order-witness` | `10.10.1.69` |
 
 Use the **same** `NODE*_HOST` / ports on every machine’s `.env`. Only `NODE_ID` differs (auto-detected from local IP, or pass `./starter.sh 1|2|3`).
 
