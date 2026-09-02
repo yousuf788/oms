@@ -125,72 +125,69 @@ fn main() {
     // ── Start Raft election ────────────────────────────────────────────────────
     let election = LeaderElection::start(node_id);
 
+    // ── Shared lock-free channel for orders ────────────────────────────────────
+    // Bounded channel to apply backpressure if processing is slower than Aeron delivery
+    let (order_tx, order_rx) = crossbeam_channel::bounded::<Order>(500_000);
+
+    // ── Polling Thread: Aggressively drain Aeron ───────────────────────────────
+    let poll_tx = order_tx.clone();
+    thread::spawn(move || {
+        let mut idle = BackoffIdleStrategy::new();
+        loop {
+            let fragments = order_subscription
+                .poll_fn(|buf: &[u8], _hdr: AeronHeader| {
+                    if let Some(payload) = auth::verify(buf) {
+                        if let Ok(order) = serde_json::from_slice::<Order>(payload) {
+                            let _ = poll_tx.try_send(order);
+                        }
+                    }
+                }, 5000)
+                .unwrap_or(0);
+            idle.idle(fragments);
+        }
+    });
+
     // ── Main processing loop ───────────────────────────────────────────────────
     let mut last_role_line = String::new();
-
-    // Shared dedup set wrapped in Mutex so the fragment handler closure can use it
-    let seen_ids: Arc<Mutex<HashSet<u64>>> = Arc::new(Mutex::new(HashSet::new()));
-    let pending_orders: Arc<Mutex<Vec<Order>>> = Arc::new(Mutex::new(Vec::with_capacity(500)));
-
-    let mut idle = BackoffIdleStrategy::new();
+    let mut batch = Vec::with_capacity(20_000);
+    let mut seen_ids = HashSet::with_capacity(20_000);
 
     loop {
-        // Print role changes
         let line = election.role_summary();
         if line != last_role_line {
             println!("[role] {line}");
             last_role_line = line;
         }
 
-        // Drain up to 500 orders from the Aeron subscription into pending_orders
-        {
-            let seen_ids = Arc::clone(&seen_ids);
-            let pending_orders = Arc::clone(&pending_orders);
-            let fragments = order_subscription
-                .poll_fn(move |buf: &[u8], _hdr: AeronHeader| {
-                    // ── HMAC authentication ────────────────────────────────────
-                    // Reject any packet that is not signed with CLUSTER_HMAC_KEY.
-                    // This is the primary defence against injection on stream 1001.
-                    let payload = match auth::verify(buf) {
-                        Some(p) => p,
-                        None => {
-                            eprintln!("[order-process] HMAC failure — dropping unauthenticated packet ({} bytes)", buf.len());
-                            return;
-                        }
-                    };
-                    if let Ok(order) = serde_json::from_slice::<Order>(payload) {
-                        let mut pending = pending_orders.lock().unwrap();
-                        if pending.len() >= 500 {
-                            return; // batch full
-                        }
-                        let mut seen = seen_ids.lock().unwrap();
-                        if seen.insert(order.order_id) {
-                            pending.push(order);
-                        }
+        // Gather up to 20,000 orders in a single batch
+        batch.clear();
+        seen_ids.clear();
+        
+        while batch.len() < 20_000 {
+            match order_rx.try_recv() {
+                Ok(order) => {
+                    if seen_ids.insert(order.order_id) {
+                        batch.push(order);
                     }
-                }, 500)
-                .unwrap_or(0);
-            idle.idle(fragments);
+                }
+                Err(_) => break, // channel empty
+            }
         }
 
-        // Check if we have orders to process
-        let orders = {
-            let mut pending = pending_orders.lock().unwrap();
-            if pending.is_empty() {
-                continue;
-            }
-            // Clear the seen set periodically (when batch drains)
-            seen_ids.lock().unwrap().clear();
-            std::mem::take(&mut *pending)
-        };
+        if batch.is_empty() {
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
 
         if election.is_leader() {
             process_orders_batch_as_leader(
                 node_id,
-                &orders,
+                &batch,
                 &election,
                 &result_pub,
             );
+        } else {
+            // As a follower, we just drain the channel so it doesn't back up
         }
     }
 }

@@ -15,9 +15,11 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Keep AppendEntries UDP packets small so catch-up never exceeds MTU/recv buffer.
-const MAX_ENTRIES_PER_APPEND: usize = 32;
-const RECV_BUF_SIZE: usize = 65_535;
+/// Keep AppendEntries UDP packets small enough to avoid excessive fragmentation, 
+/// but large enough to support 200k TPS batching. With 10,000 entries, the payload
+/// might be ~1.5MB, so we must increase the UDP receive buffer.
+const MAX_ENTRIES_PER_APPEND: usize = 10_000;
+const RECV_BUF_SIZE: usize = 2_000_000;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Role {

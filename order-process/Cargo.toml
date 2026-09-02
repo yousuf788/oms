@@ -15,3 +15,4 @@ dotenvy = "0.15"
 rusteron-client = { version = "0.2", features = ["static", "precompile"] }
 hmac = "0.12"
 sha2 = "0.10"
+crossbeam-channel = "0.5"
