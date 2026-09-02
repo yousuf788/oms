@@ -8,6 +8,9 @@ pub struct S2Node {
     pub host: String,
     pub raft_port: u16,
     pub order_port: u16,
+    /// Trivial liveness-probe port, used only by the witness service — completely
+    /// separate from `raft_port` so witness probes never touch Raft consensus state.
+    pub health_port: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -23,6 +26,16 @@ pub struct ClusterConfig {
     /// When peers are silent, allow this node to win with only its own vote (lab failover).
     pub allow_single_node_leader: bool,
     pub peer_silent_ms: u64,
+    /// Address of the independent witness service consulted before a lone node is
+    /// allowed to self-promote. `None` if `WITNESS_HOST` isn't set.
+    pub witness_host: Option<String>,
+    pub witness_port: u16,
+    pub witness_timeout_ms: u64,
+    pub witness_retry_interval_ms: u64,
+    /// If true (default), a witness must corroborate before single-node self-promotion
+    /// is allowed — no witness reachable means no promotion. If false, falls back to
+    /// the legacy blind-timeout behavior (local demo only).
+    pub require_witness_for_single_node_leader: bool,
 }
 
 static CONFIG: OnceLock<ClusterConfig> = OnceLock::new();
@@ -69,6 +82,7 @@ fn load_from_env() -> ClusterConfig {
                 host: env_required("NODE1_HOST"),
                 raft_port: env_u16("NODE1_RAFT_PORT", 6001),
                 order_port: env_u16("NODE1_ORDER_PORT", 7001),
+                health_port: env_u16("NODE1_HEALTH_PORT", 6101),
             },
             S2Node {
                 id: 2,
@@ -76,6 +90,7 @@ fn load_from_env() -> ClusterConfig {
                 host: env_required("NODE2_HOST"),
                 raft_port: env_u16("NODE2_RAFT_PORT", 6002),
                 order_port: env_u16("NODE2_ORDER_PORT", 7002),
+                health_port: env_u16("NODE2_HEALTH_PORT", 6102),
             },
             S2Node {
                 id: 3,
@@ -83,6 +98,7 @@ fn load_from_env() -> ClusterConfig {
                 host: env_required("NODE3_HOST"),
                 raft_port: env_u16("NODE3_RAFT_PORT", 6003),
                 order_port: env_u16("NODE3_ORDER_PORT", 7003),
+                health_port: env_u16("NODE3_HEALTH_PORT", 6103),
             },
         ],
         bind_host: env_or("BIND_HOST", "0.0.0.0"),
@@ -94,6 +110,14 @@ fn load_from_env() -> ClusterConfig {
         verbose_raft: env_bool("VERBOSE_RAFT", false),
         allow_single_node_leader: env_bool("ALLOW_SINGLE_NODE_LEADER", true),
         peer_silent_ms: env_u64("PEER_SILENT_MS", 2000),
+        witness_host: env::var("WITNESS_HOST").ok(),
+        witness_port: env_u16("WITNESS_PORT", 9001),
+        witness_timeout_ms: env_u64("WITNESS_TIMEOUT_MS", 1500),
+        witness_retry_interval_ms: env_u64("WITNESS_RETRY_INTERVAL_MS", 2000),
+        require_witness_for_single_node_leader: env_bool(
+            "REQUIRE_WITNESS_FOR_SINGLE_NODE_LEADER",
+            true,
+        ),
     }
 }
 
@@ -210,4 +234,28 @@ pub fn election_timeout_min_ms() -> u64 {
 
 pub fn election_timeout_max_ms() -> u64 {
     config().election_timeout_max_ms
+}
+
+pub fn witness_host() -> Option<String> {
+    config().witness_host.clone()
+}
+
+pub fn witness_port() -> u16 {
+    config().witness_port
+}
+
+pub fn witness_timeout_ms() -> u64 {
+    config().witness_timeout_ms
+}
+
+pub fn witness_retry_interval_ms() -> u64 {
+    config().witness_retry_interval_ms
+}
+
+pub fn require_witness_for_single_node_leader() -> bool {
+    config().require_witness_for_single_node_leader
+}
+
+pub fn health_port(id: u8) -> Option<u16> {
+    find_node(id).map(|n| n.health_port)
 }

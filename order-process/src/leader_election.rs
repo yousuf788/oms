@@ -1,9 +1,10 @@
 use crate::config::{
     allow_single_node_leader, election_timeout_max_ms, election_timeout_min_ms, find_node,
-    format_role_summary, heartbeat_interval_ms, node_name, peer_silent_ms, s2_nodes, verbose_raft,
-    S2Node,
+    format_role_summary, heartbeat_interval_ms, node_name, peer_silent_ms,
+    require_witness_for_single_node_leader, s2_nodes, verbose_raft, S2Node,
 };
 use crate::wal::{LogEntry, ReplicatedCommand, Wal};
+use crate::witness_client::{CachedVerdict, CorroborationOutcome, WitnessClient};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -92,6 +93,10 @@ pub struct LeaderElection {
     /// allowing single-node self-election. Prevents all nodes self-electing
     /// simultaneously on startup before peers have had a chance to respond.
     started_at: Instant,
+    /// Independent-witness corroboration client — see `witness_loop()` and
+    /// `peers_unreachable()`. A local isolation timeout is never sufficient on
+    /// its own to justify self-promotion; this is what corroborates it.
+    witness: WitnessClient,
 }
 
 impl LeaderElection {
@@ -143,18 +148,29 @@ impl LeaderElection {
             wal: Mutex::new(wal),
             is_leader_flag: AtomicBool::new(false),
             started_at: Instant::now(),
+            witness: WitnessClient::new(),
         });
 
         println!(
             "[role] {} started as FOLLOWER (waiting for leader)",
             node_name(self_id)
         );
+        if !election.witness.is_configured() && require_witness_for_single_node_leader() {
+            println!(
+                "[witness] no WITNESS_HOST configured — single-node self-promotion is disabled \
+                 (REQUIRE_WITNESS_FOR_SINGLE_NODE_LEADER=true); set WITNESS_HOST or set that flag \
+                 to false to restore the legacy blind-timeout behavior"
+            );
+        }
 
         let recv_handle = Arc::clone(&election);
         thread::spawn(move || recv_handle.recv_loop());
 
         let tick_handle = Arc::clone(&election);
         thread::spawn(move || tick_handle.tick_loop());
+
+        let witness_handle = Arc::clone(&election);
+        thread::spawn(move || witness_handle.witness_loop());
 
         election
     }
@@ -384,7 +400,73 @@ impl LeaderElection {
         if self.started_at.elapsed() < grace {
             return false;
         }
-        self.alive_node_count(st) == 1
+        if self.alive_node_count(st) != 1 {
+            return false;
+        }
+        if !require_witness_for_single_node_leader() {
+            // Legacy blind-timeout path (opt-out flag, local demo only) — a local
+            // timeout alone is treated as sufficient, exactly as before this change.
+            return true;
+        }
+        // A local timeout alone is never sufficient: this node cannot tell from the
+        // inside whether both peers are genuinely down or whether it's the one that
+        // got partitioned while its peers formed their own quorum. Promotion requires
+        // the independent witness's corroboration (see `witness_loop()`). No witness
+        // reachable is treated identically to "peers confirmed still up" — uncertainty
+        // always resolves to staying passive, never to promoting.
+        self.witness.cached_verdict() == CachedVerdict::SafeToPromote
+    }
+
+    /// Background thread: while this node looks locally isolated (per
+    /// `peers_unreachable`'s own timeout check), periodically asks the independent
+    /// witness to corroborate before caching a verdict `peers_unreachable()` can act
+    /// on. Runs on its own cadence, independent of `tick_loop`'s 50ms cycle, and never
+    /// performs I/O while holding `state`'s lock — a witness round-trip can take up to
+    /// `WITNESS_TIMEOUT_MS`, which would otherwise stall `recv_loop` and all consensus.
+    fn witness_loop(&self) {
+        loop {
+            thread::sleep(Duration::from_millis(250));
+
+            if !allow_single_node_leader() || !require_witness_for_single_node_leader() {
+                continue;
+            }
+
+            let isolated = {
+                let st = self.state.lock().unwrap();
+                let grace = Duration::from_millis(peer_silent_ms());
+                self.started_at.elapsed() >= grace && self.alive_node_count(&st) == 1
+            };
+
+            if !isolated {
+                self.witness.reset_if_not_isolated();
+                continue;
+            }
+
+            if !self.witness.due_for_attempt() {
+                continue;
+            }
+
+            let term = self.current_term();
+            let (outcome, changed) = self.witness.attempt_corroboration(self.self_id, term);
+            if changed {
+                let name = node_name(self.self_id);
+                match outcome {
+                    CorroborationOutcome::SafeToPromote => println!(
+                        "[witness] corroboration confirmed both peers unreachable — {name} eligible to self-promote"
+                    ),
+                    CorroborationOutcome::DeniedByWitness => println!(
+                        "[witness] corroboration denied: witness reports a peer still reachable — {name} staying passive"
+                    ),
+                    CorroborationOutcome::WitnessUnreachable => println!(
+                        "[witness] witness unreachable after {}ms — {name} staying passive",
+                        crate::config::witness_timeout_ms()
+                    ),
+                    CorroborationOutcome::NotConfigured => println!(
+                        "[witness] no witness configured — {name} staying passive (REQUIRE_WITNESS_FOR_SINGLE_NODE_LEADER=true)"
+                    ),
+                }
+            }
+        }
     }
 
     /// Majority needed to commit / win an election.
@@ -443,8 +525,13 @@ impl LeaderElection {
         st.leader_since_term = st.term;
         self.is_leader_flag.store(true, Ordering::Relaxed);
         if self.peers_unreachable(st) {
+            let mode = if !require_witness_for_single_node_leader() {
+                "legacy blind timeout"
+            } else {
+                "witness-corroborated"
+            };
             println!(
-                "[role] {} is LEADER (single-node: other machines unreachable)",
+                "[role] {} is LEADER (single-node: other machines unreachable, {mode})",
                 node_name(self.self_id)
             );
         } else {

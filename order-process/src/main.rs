@@ -4,6 +4,7 @@
 // All Raft consensus, WAL, and leader election logic is unchanged.
 
 use order_process::config::{find_node, init_config, node_name, resolve_node_id};
+use order_process::health_probe::start_health_responder;
 use order_process::leader_election::LeaderElection;
 use order_process::wal::ReplicatedCommand;
 use rand::Rng;
@@ -48,6 +49,11 @@ fn main() {
     }
 
     let self_node = find_node(node_id).expect("unknown NODE_ID");
+
+    // Trivial liveness responder for the witness service — independent of Aeron
+    // and the Raft control channel, so it comes up even before either does.
+    start_health_responder(node_id, &cfg.bind_host, self_node.health_port);
+
     println!(
         "[role] {} (S2-{}) starting — peers: {}",
         node_name(node_id),
