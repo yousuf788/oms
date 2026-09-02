@@ -6,8 +6,7 @@
 // WITNESS_HMAC_KEY. Unauthenticated packets are dropped without a response.
 // Every outbound response is also signed so order-process nodes can verify it.
 
-use crate::auth;
-use crate::config::{config, other_nodes};
+use crate::config::{config, find_node, other_nodes};
 use crate::health_poll::{probe_now, HealthTable, PeerHealth};
 use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
@@ -34,6 +33,10 @@ enum CorroborationMsg {
 #[derive(Serialize, Deserialize)]
 struct PeerCheck {
     node_id: u8,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    host: String,
     reachable: bool,
     age_ms: u64,
 }
@@ -113,7 +116,13 @@ pub fn start_corroboration_responder(table: HealthTable) {
                     (probe_now(&peer.host, peer.health_port, probe_timeout), 0)
                 }
             };
-            checks.push(PeerCheck { node_id: peer.id, reachable, age_ms });
+            checks.push(PeerCheck {
+                node_id: peer.id,
+                name: peer.name.clone(),
+                host: peer.host.clone(),
+                reachable,
+                age_ms,
+            });
         }
 
         let verdict = if checks.iter().all(|c| !c.reachable) {
@@ -122,21 +131,31 @@ pub fn start_corroboration_responder(table: HealthTable) {
             Verdict::PeersStillUp
         };
 
+        let requester_label = find_node(requester_id)
+            .map(|n| n.label())
+            .unwrap_or_else(|| format!("node {requester_id}"));
+
         append_log(&format!(
             "{},{},{},{},{},{}",
             now_ms(),
             request_id,
-            requester_id,
+            requester_label,
             term,
             checks
                 .iter()
-                .map(|c| format!("{}:{}:{}ms", c.node_id, if c.reachable { "up" } else { "down" }, c.age_ms))
+                .map(|c| format!(
+                    "{} ({}):{}:{}ms",
+                    c.name,
+                    c.host,
+                    if c.reachable { "up" } else { "down" },
+                    c.age_ms
+                ))
                 .collect::<Vec<_>>()
                 .join("|"),
             format!("{verdict:?}"),
         ));
         println!(
-            "[witness] corroboration request from node {requester_id} (term {term}) -> {verdict:?} ({}ms)",
+            "[witness] corroboration request from {requester_label} (term {term}) -> {verdict:?} ({}ms)",
             start.elapsed().as_millis()
         );
 

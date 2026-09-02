@@ -4,8 +4,17 @@ use std::sync::OnceLock;
 #[derive(Clone, Debug)]
 pub struct WatchedNodeAddr {
     pub id: u8,
+    pub name: String,
     pub host: String,
     pub health_port: u16,
+}
+
+impl WatchedNodeAddr {
+    /// e.g. "Amit (172.16.13.181)" — used everywhere a log line would
+    /// otherwise print a bare node id.
+    pub fn label(&self) -> String {
+        format!("{} ({})", self.name, self.host)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -63,16 +72,19 @@ fn load_from_env() -> WitnessConfig {
         nodes: vec![
             WatchedNodeAddr {
                 id: 1,
+                name: env_or("NODE1_NAME", "Nitin"),
                 host: env_required("NODE1_HOST"),
                 health_port: env_u16("NODE1_HEALTH_PORT", 6101),
             },
             WatchedNodeAddr {
                 id: 2,
+                name: env_or("NODE2_NAME", "Amit"),
                 host: env_required("NODE2_HOST"),
                 health_port: env_u16("NODE2_HEALTH_PORT", 6102),
             },
             WatchedNodeAddr {
                 id: 3,
+                name: env_or("NODE3_NAME", "Yousuf"),
                 host: env_required("NODE3_HOST"),
                 health_port: env_u16("NODE3_HEALTH_PORT", 6103),
             },
@@ -101,4 +113,10 @@ pub fn other_nodes(requester_id: u8) -> Vec<WatchedNodeAddr> {
         .filter(|n| n.id != requester_id)
         .cloned()
         .collect()
+}
+
+/// Looks up a single configured node by id — used to label a requester
+/// (e.g. "Amit (172.16.13.181)") in logs instead of a bare node id.
+pub fn find_node(id: u8) -> Option<WatchedNodeAddr> {
+    config().nodes.iter().find(|n| n.id == id).cloned()
 }

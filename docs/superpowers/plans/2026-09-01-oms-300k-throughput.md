@@ -59,7 +59,7 @@ mod tests {
                 qty: 5,
                 status: "FILLED".to_string(),
                 filled_qty: 5,
-                processed_by: "Vivek (S2-1)".to_string(),
+                processed_by: "Nitin (S2-1)".to_string(),
                 term: 1,
             },
         }
@@ -280,7 +280,7 @@ mod tests {
                 qty: 1,
                 status: "FILLED".to_string(),
                 filled_qty: 1,
-                processed_by: "Vivek (S2-1)".to_string(),
+                processed_by: "Nitin (S2-1)".to_string(),
                 term: 1,
             },
         }
@@ -1411,14 +1411,14 @@ Create `scripts/run_lab_benchmark.md`:
 ```markdown
 # 300k orders/sec lab benchmark runbook
 
-Run on the real 3-machine deployment (Vivek / Amit / Yousuf, per docs/HLD.md).
+Run on the real 3-machine deployment (Nitin / Amit / Yousuf, per docs/HLD.md).
 Each machine already has its own `order-process/.env` (real IPs) from prior
 setup — do not use `.env.example` or `run_benchmark.sh`'s isolated ports for
 this run.
 
 ## 1. Rebuild release binaries on every machine
 
-On **each** of Vivek, Amit, Yousuf:
+On **each** of Nitin, Amit, Yousuf:
 
     cd order-process && cargo build --release
     cd ../order-sending && cargo build --release   # Yousuf only (S1 lives here)
@@ -1426,7 +1426,7 @@ On **each** of Vivek, Amit, Yousuf:
 
 ## 2. Start the Aeron Media Driver on every machine
 
-On **each** of Vivek, Amit, Yousuf:
+On **each** of Nitin, Amit, Yousuf:
 
     ./scripts/start-media-driver.sh
 
@@ -1438,7 +1438,7 @@ script) before proceeding:
 
 ## 3. Start order-process on all 3 nodes
 
-On Vivek:    `cd order-process && ./starter.sh 1`
+On Nitin:    `cd order-process && ./starter.sh 1`
 On Amit:     `cd order-process && ./starter.sh 2`
 On Yousuf:   `cd order-process && ./starter.sh 3`
 
@@ -1482,7 +1482,7 @@ check, in order of likely impact:
 - Raise `SENDER_THREADS` if generator threads (not the fan-out/publisher
   threads) are the bottleneck.
 - Actual LAN bandwidth between the 3 machines (unknown at design time) —
-  `iperf3` between Vivek/Amit/Yousuf if throughput plateaus well under
+  `iperf3` between Nitin/Amit/Yousuf if throughput plateaus well under
   300k/sec despite low CPU usage everywhere.
 ```
 

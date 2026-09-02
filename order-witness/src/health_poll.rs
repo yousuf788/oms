@@ -106,7 +106,7 @@ pub fn start_health_poller() -> HealthTable {
                 let mut reachable = probe_once(&socket, &node.host, node.health_port, timeout);
                 if !reachable {
                     if cfg.verbose {
-                        println!("[witness] node {} missed probe, retrying...", node.id);
+                        println!("[witness] {} missed probe, retrying...", node.label());
                     }
                     for _ in 0..cfg.probe_retries {
                         if probe_once(&socket, &node.host, node.health_port, timeout) {
@@ -123,8 +123,15 @@ pub fn start_health_poller() -> HealthTable {
 
                 if changed {
                     let state = if reachable { "reachable" } else { "unreachable" };
-                    append_log(&format!("{},{},{}", now_ms(), node.id, state));
-                    println!("[witness] node {} is now {state}", node.id);
+                    append_log(&format!(
+                        "{},{},{},{},{}",
+                        now_ms(),
+                        node.id,
+                        node.name,
+                        node.host,
+                        state
+                    ));
+                    println!("[witness] {} is now {state}", node.label());
                 }
             }
             thread::sleep(Duration::from_millis(cfg.poll_interval_ms));

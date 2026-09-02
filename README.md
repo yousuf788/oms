@@ -23,7 +23,7 @@ flowchart LR
 
     subgraph S2["order-process cluster (S2)"]
         direction TB
-        N1["Vivek S2-1\nraft :6001 / orders :7001\nWAL"]
+        N1["Nitin S2-1\nraft :6001 / orders :7001\nWAL"]
         N2["Amit S2-2\nraft :6002 / orders :7002\nWAL"]
         N3["Yousuf S2-3\nraft :6003 / orders :7003\nWAL"]
         N1 <-->|"Raft UDP"| N2
@@ -56,7 +56,7 @@ flowchart LR
 
 | Machine | Name in logs | Services | Example IP |
 |---|---|---|---|
-| Vivek | `NODE1_NAME=Vivek` | `order-process` (node 1) | `172.16.12.104` |
+| Nitin | `NODE1_NAME=Nitin` | `order-process` (node 1) | `172.16.12.104` |
 | Amit | `NODE2_NAME=Amit` | `order-process` (node 2) | `172.16.13.181` |
 | Yousuf | `NODE3_NAME=Yousuf` | `order-process` (node 3) + sender + receiver + `order-witness` | `172.16.12.252` |
 
@@ -68,9 +68,9 @@ Use the **same** `NODE*_HOST` / ports on every machine’s `.env`. Only `NODE_ID
 
 | Purpose | Port |
 |---|---|
-| Raft (Vivek / Amit / Yousuf) | `6001` / `6002` / `6003` |
-| Orders in (Vivek / Amit / Yousuf) | `7001` / `7002` / `7003` |
-| Health probe — witness only (Vivek / Amit / Yousuf) | `6101` / `6102` / `6103` |
+| Raft (Nitin / Amit / Yousuf) | `6001` / `6002` / `6003` |
+| Orders in (Nitin / Amit / Yousuf) | `7001` / `7002` / `7003` |
+| Health probe — witness only (Nitin / Amit / Yousuf) | `6101` / `6102` / `6103` |
 | Sender bind | `9001` |
 | Receiver bind | `8001` |
 | Witness corroboration | `9101` (on the witness machine) |
@@ -100,7 +100,7 @@ cd order-process && cp .env.example .env
 **Multi-machine lab**
 
 ```bash
-cd order-process && cp cluster.sample .env   # same file on Vivek, Amit, Yousuf
+cd order-process && cp cluster.sample .env   # same file on Nitin, Amit, Yousuf
 cd ../order-sending && cp cluster.sample .env
 cd ../order-receiver && cp .env.example .env
 # set S3_HOST / NODE* to match your LAN
@@ -110,7 +110,7 @@ cd ../order-receiver && cp .env.example .env
 
 | Variable | Meaning | Default |
 |---|---|---|
-| `NODE1/2/3_NAME` | Names in `[role]` lines | Vivek / Amit / Yousuf |
+| `NODE1/2/3_NAME` | Names in `[role]` lines | Nitin / Amit / Yousuf |
 | `NODE1/2/3_HOST` | Peer IPs (**required**) | — |
 | `S3_HOST` / `S3_PORT` | Where leader sends results | port `8001` |
 | `ALLOW_SINGLE_NODE_LEADER` | Alone node may elect + commit | `true` |
@@ -135,12 +135,12 @@ cd ../order-witness && cargo build --release
 
 ### Multi-machine (recommended)
 
-**On Vivek / Amit / Yousuf (order-process):**
+**On Nitin / Amit / Yousuf (order-process):**
 
 ```bash
 cd order-process
 ./starter.sh          # NODE_ID from this machine’s IP
-# or: ./starter.sh 1  # Vivek   ./starter.sh 2  # Amit   ./starter.sh 3  # Yousuf
+# or: ./starter.sh 1  # Nitin   ./starter.sh 2  # Amit   ./starter.sh 3  # Yousuf
 ```
 
 `starter.sh` loads `.env`, installs Rust via rustup if needed, and runs release.
@@ -178,13 +178,13 @@ https://sh.rustup.rs | sh`.
 **Role line (order-process):**
 
 ```text
-[role] Vivek is LEADER; Amit is FOLLOWER; Yousuf is FOLLOWER
+[role] Nitin is LEADER; Amit is FOLLOWER; Yousuf is FOLLOWER
 ```
 
 When peers are down:
 
 ```text
-[role] Vivek is not available; Amit is not available; Yousuf is LEADER
+[role] Nitin is not available; Amit is not available; Yousuf is LEADER
 ```
 
 **Order files (append-only):**
