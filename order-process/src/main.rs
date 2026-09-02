@@ -2,8 +2,14 @@
 // Subscribes to order channel via Aeron (replaces raw UDP recv).
 // Publishes committed results to S3 via Aeron (replaces raw UDP send).
 // All Raft consensus, WAL, and leader election logic is unchanged.
+//
+// Security: every inbound Aeron order message must carry a valid HMAC-SHA256
+// tag (written by order-sending). Raft control messages use the same key.
+// Witness corroboration messages use a separate WITNESS_HMAC_KEY.
+// Set CLUSTER_HMAC_KEY and WITNESS_HMAC_KEY in .env (openssl rand -hex 32).
 
 use order_process::config::{find_node, init_config, node_name, resolve_node_id};
+use order_process::auth;
 use order_process::health_probe::start_health_responder;
 use order_process::leader_election::LeaderElection;
 use order_process::wal::ReplicatedCommand;
@@ -142,7 +148,17 @@ fn main() {
             let pending_orders = Arc::clone(&pending_orders);
             let fragments = order_subscription
                 .poll_fn(move |buf: &[u8], _hdr: AeronHeader| {
-                    if let Ok(order) = serde_json::from_slice::<Order>(buf) {
+                    // ── HMAC authentication ────────────────────────────────────
+                    // Reject any packet that is not signed with CLUSTER_HMAC_KEY.
+                    // This is the primary defence against injection on stream 1001.
+                    let payload = match auth::verify(buf) {
+                        Some(p) => p,
+                        None => {
+                            eprintln!("[order-process] HMAC failure — dropping unauthenticated packet ({} bytes)", buf.len());
+                            return;
+                        }
+                    };
+                    if let Ok(order) = serde_json::from_slice::<Order>(payload) {
                         let mut pending = pending_orders.lock().unwrap();
                         if pending.len() >= 500 {
                             return; // batch full

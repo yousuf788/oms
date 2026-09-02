@@ -2,12 +2,11 @@
 // health_poll cache (near-instant) unless the cached entry is stale, in which case it
 // falls back to one fresh synchronous probe rather than answer from outdated data.
 //
-// Decision rule: SafeToPromote iff BOTH of the requester's peers are currently marked
-// unreachable. If either is reachable, PeersStillUp — even one live peer means the
-// "genuine dual failure" precondition doesn't hold, so the isolated node must stay
-// passive. This is the one place that answers the question the whole feature exists
-// to answer, so every request is logged unconditionally (the audit trail).
+// Security: every inbound request must carry a valid HMAC-SHA256 tag signed with
+// WITNESS_HMAC_KEY. Unauthenticated packets are dropped without a response.
+// Every outbound response is also signed so order-process nodes can verify it.
 
+use crate::auth;
 use crate::config::{config, other_nodes};
 use crate::health_poll::{probe_now, HealthTable, PeerHealth};
 use serde::{Deserialize, Serialize};
@@ -81,8 +80,21 @@ pub fn start_corroboration_responder(table: HealthTable) {
             Ok(v) => v,
             Err(_) => continue,
         };
+
+        // ── HMAC verification ────────────────────────────────────────
+        // Reject any corroboration request that lacks a valid WITNESS_HMAC_KEY
+        // signature. Without this, an attacker can forge SafeToPromote responses
+        // by replaying or crafting requests to fish for them.
+        let inner = match auth::verify(&buf[..n]) {
+            Some(p) => p,
+            None => {
+                eprintln!("[witness] dropping corroboration request from {src}: HMAC failure");
+                continue;
+            }
+        };
+
         let Ok(CorroborationMsg::Request { request_id, requester_id, term }) =
-            serde_json::from_slice::<CorroborationMsg>(&buf[..n])
+            serde_json::from_slice::<CorroborationMsg>(inner)
         else {
             continue; // garbage/unrecognized packet — silently ignored
         };
@@ -129,8 +141,12 @@ pub fn start_corroboration_responder(table: HealthTable) {
         );
 
         let response = CorroborationMsg::Response { request_id, peers_checked: checks, verdict };
-        if let Ok(payload) = serde_json::to_vec(&response) {
-            let _ = socket.send_to(&payload, src);
+        if let Ok(inner) = serde_json::to_vec(&response) {
+            // Sign the response so order-process nodes can verify it.
+            // A response without a valid HMAC is treated as WitnessUnreachable
+            // (fail-safe: stay passive) on the receiving end.
+            let frame = auth::sign(&inner);
+            let _ = socket.send_to(&frame, src);
         }
     }
 }

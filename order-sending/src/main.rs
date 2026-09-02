@@ -5,6 +5,7 @@
 //   - Backpressure: if publications are slow, generator threads block (no silent drops)
 // Rate-paced to TARGET_TPS orders/sec (default 5000).
 
+mod auth;
 mod config;
 
 use config::init_config;
@@ -86,7 +87,10 @@ fn main() {
 
     // ── Channel: generator threads → publisher thread ──────────────────────────
     // Bounded so generator threads apply backpressure when publisher is slow.
-    let (payload_tx, payload_rx) = mpsc::sync_channel::<String>(target_tps.max(10000) as usize);
+    // Channel carries (signed_frame_bytes, raw_json_for_log).
+    let (payload_tx, payload_rx) = mpsc::sync_channel::<(Vec<u8>, String)>(target_tps.max(10000) as usize);
+    // Eagerly load the key at startup so we panic early if CLUSTER_HMAC_KEY is missing.
+    let _ = auth::cluster_key();
 
     // ── Background log writer ──────────────────────────────────────────────────
     let (log_tx, log_rx) = mpsc::sync_channel::<String>(1_000_000);
@@ -170,9 +174,12 @@ fn main() {
                     let payload = format!(
                         "{{\"order_id\":{order_id},\"symbol\":\"{symbol}\",\"side\":\"{side}\",\"qty\":{qty},\"ts_ms\":{ts_ms}}}"
                     );
+                    // Sign the JSON payload before putting it on the wire.
+                    // order-process verifies this HMAC; unauthenticated packets are dropped.
+                    let signed_payload = auth::sign(payload.as_bytes());
 
-                    // Send to publisher thread (blocks if publisher is busy → backpressure)
-                    if payload_tx.send(payload.clone()).is_err() {
+                    // Send signed frame to publisher thread (blocks → backpressure)
+                    if payload_tx.send((signed_payload, payload.clone())).is_err() {
                         break; // publisher thread exited
                     }
                     sent_total.fetch_add(1, Ordering::Relaxed);
@@ -207,15 +214,14 @@ fn main() {
     let mut idle = BusySpinIdleStrategy::default();
     loop {
         match payload_rx.recv() {
-            Ok(payload) => {
-                let payload_bytes = payload.as_bytes();
+            Ok((signed_frame, _raw)) => {
                 for pub_ in &publications {
                     if !pub_.is_connected() {
                         continue;
                     }
                     let mut retries = 0u32;
                     loop {
-                        match pub_.offer(payload_bytes) {
+                        match pub_.offer(&signed_frame) {
                             Ok(_) => break,
                             Err(e) if e.is_retryable() && retries < MAX_BACKPRESSURE_RETRIES => {
                                 retries += 1;

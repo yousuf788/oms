@@ -7,6 +7,7 @@
 // "peers are also down" answer — no witness configured, send error, timeout, garbage
 // response — resolves to "stay passive". Uncertainty never resolves to promotion.
 
+use crate::auth;
 use crate::config::{witness_host, witness_port, witness_retry_interval_ms, witness_timeout_ms};
 use serde::{Deserialize, Serialize};
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
@@ -156,10 +157,13 @@ impl WitnessClient {
 
         let request_id: u64 = rand::random();
         let request = CorroborationMsg::Request { request_id, requester_id, term };
-        let payload = match serde_json::to_vec(&request) {
+        let inner_payload = match serde_json::to_vec(&request) {
             Ok(p) => p,
             Err(_) => return CorroborationOutcome::WitnessUnreachable,
         };
+        // Sign the request with WITNESS_HMAC_KEY so the witness can reject
+        // forged or replayed corroboration requests.
+        let payload = auth::sign_witness(&inner_payload);
 
         let deadline = Instant::now() + self.timeout;
         let resend_at = Instant::now() + self.timeout / 3;
@@ -180,8 +184,19 @@ impl WitnessClient {
             let _ = socket.set_read_timeout(Some(slice.max(Duration::from_millis(1))));
             match socket.recv_from(&mut buf) {
                 Ok((n, _src)) => {
+                    // Verify the response HMAC before trusting the verdict.
+                    // A forged SafeToPromote without a valid WITNESS_HMAC_KEY
+                    // signature is indistinguishable from WitnessUnreachable
+                    // (the fail-safe default: stay passive).
+                    let inner = match auth::verify_witness(&buf[..n]) {
+                        Some(p) => p,
+                        None => {
+                            eprintln!("[witness-client] HMAC failure on corroboration response — staying passive");
+                            continue; // keep waiting until deadline
+                        }
+                    };
                     if let Ok(CorroborationMsg::Response { request_id: rid, verdict, .. }) =
-                        serde_json::from_slice::<CorroborationMsg>(&buf[..n])
+                        serde_json::from_slice::<CorroborationMsg>(inner)
                     {
                         if rid == request_id {
                             return match verdict {

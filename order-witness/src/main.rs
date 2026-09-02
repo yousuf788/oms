@@ -3,6 +3,7 @@
 // consensus state. It only answers one question for an isolated node: "can you reach
 // my peers right now?" — see corroboration.rs for the decision rule.
 
+mod auth;
 mod config;
 mod corroboration;
 mod health_poll;
@@ -13,6 +14,8 @@ use health_poll::start_health_poller;
 
 fn main() {
     let cfg = init_config();
+    // Eagerly load WITNESS_HMAC_KEY — panics with a clear message if not set.
+    let _ = auth::witness_key();
     println!(
         "[witness] starting — watching: {}",
         cfg.nodes

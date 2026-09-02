@@ -1,3 +1,4 @@
+use crate::auth;
 use crate::config::{
     allow_single_node_leader, election_timeout_max_ms, election_timeout_min_ms, find_node,
     format_role_summary, heartbeat_interval_ms, node_name, peer_silent_ms,
@@ -8,7 +9,7 @@ use crate::witness_client::{CachedVerdict, CorroborationOutcome, WitnessClient};
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::net::UdpSocket;
+use std::net::{IpAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -89,6 +90,9 @@ pub struct LeaderElection {
     state: Mutex<RaftState>,
     wal: Mutex<Wal>,
     is_leader_flag: AtomicBool,
+    /// Resolved peer IP addresses for the source-IP allowlist in recv_loop.
+    /// Built once at startup from NODE*_HOST config values.
+    allowed_ips: Vec<IpAddr>,
     /// When this node started — used to enforce a startup grace period before
     /// allowing single-node self-election. Prevents all nodes self-electing
     /// simultaneously on startup before peers have had a chance to respond.
@@ -123,6 +127,17 @@ impl LeaderElection {
             .expect("failed to bind control channel");
         let wal = Wal::new(self_id).expect("failed to open replicated WAL");
 
+        // Build the IP allowlist from configured peer host strings.
+        // This is resolved once at startup; dynamic DNS changes require a restart.
+        let allowed_ips: Vec<IpAddr> = s2_nodes()
+            .iter()
+            .filter_map(|n| n.host.parse::<IpAddr>().ok())
+            .collect();
+
+        // Eagerly load CLUSTER_HMAC_KEY at startup so we panic immediately if it
+        // is missing, rather than the first time a packet is sent/received.
+        let _ = auth::cluster_key();
+
         let election = Arc::new(LeaderElection {
             self_id,
             peers,
@@ -147,6 +162,7 @@ impl LeaderElection {
             }),
             wal: Mutex::new(wal),
             is_leader_flag: AtomicBool::new(false),
+            allowed_ips,
             started_at: Instant::now(),
             witness: WitnessClient::new(),
         });
@@ -322,7 +338,10 @@ impl LeaderElection {
 
     fn send(&self, peer: &S2Node, msg: &Message) {
         if let Ok(buf) = serde_json::to_vec(msg) {
-            let _ = self.socket.send_to(&buf, (peer.host.as_str(), peer.raft_port));
+            // Sign every outbound Raft control message with CLUSTER_HMAC_KEY.
+            // recv_loop on the peer side verifies this before handle_message().
+            let frame = auth::sign(&buf);
+            let _ = self.socket.send_to(&frame, (peer.host.as_str(), peer.raft_port));
         }
     }
 
@@ -771,11 +790,36 @@ impl LeaderElection {
     fn recv_loop(&self) {
         let mut buf = [0u8; RECV_BUF_SIZE];
         loop {
-            let (n, _src) = match self.socket.recv_from(&mut buf) {
+            let (n, src) = match self.socket.recv_from(&mut buf) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let msg: Message = match serde_json::from_slice(&buf[..n]) {
+
+            // ── Source-IP allowlist ────────────────────────────────────────
+            // Drop packets from any IP that is not a configured cluster node.
+            // This is a first-pass filter; HMAC is the cryptographic guarantee.
+            if !self.allowed_ips.contains(&src.ip()) {
+                if verbose_raft() {
+                    eprintln!("[S2-{}] dropping Raft packet from unknown src {src}", self.self_id);
+                }
+                continue;
+            }
+
+            // ── HMAC verification ────────────────────────────────────────
+            // Reject any Raft message that lacks a valid CLUSTER_HMAC_KEY signature.
+            // Without this, any host can forge RequestVote to disrupt leadership.
+            let payload = match auth::verify(&buf[..n]) {
+                Some(p) => p,
+                None => {
+                    eprintln!(
+                        "[S2-{}] dropping Raft packet from {src}: HMAC failure ({n} bytes)",
+                        self.self_id
+                    );
+                    continue;
+                }
+            };
+
+            let msg: Message = match serde_json::from_slice(payload) {
                 Ok(m) => m,
                 Err(err) => {
                     if verbose_raft() {
