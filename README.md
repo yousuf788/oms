@@ -7,6 +7,7 @@ Microservice-style order pipeline with a 3-node Raft-style processing cluster.
 | **S1** | `order-sending/` | Creates one order per second; UDP fan-out to all S2 nodes |
 | **S2** | `order-process/` | 3-replica cluster: election, WAL replication, quorum commit |
 | **S3** | `order-receiver/` | Prints / logs final results from the **leader only** |
+| Witness | `order-witness/` | Independent arbiter: corroborates single-node self-promotion (see below) |
 
 Each service is a standalone Rust crate (own `Cargo.toml`, own `target/`). **All hosts/IPs come from `.env` files — nothing is hardcoded in Rust.**
 
@@ -57,7 +58,7 @@ flowchart LR
 |---|---|---|---|
 | Vivek | `NODE1_NAME=Vivek` | `order-process` (node 1) | `172.16.12.104` |
 | Amit | `NODE2_NAME=Amit` | `order-process` (node 2) | `172.16.13.181` |
-| Yousuf | `NODE3_NAME=Yousuf` | `order-process` (node 3) + sender + receiver | `172.16.12.252` |
+| Yousuf | `NODE3_NAME=Yousuf` | `order-process` (node 3) + sender + receiver + `order-witness` | `172.16.12.252` |
 
 Use the **same** `NODE*_HOST` / ports on every machine’s `.env`. Only `NODE_ID` differs (auto-detected from local IP, or pass `./starter.sh 1|2|3`).
 
@@ -69,8 +70,10 @@ Use the **same** `NODE*_HOST` / ports on every machine’s `.env`. Only `NODE_ID
 |---|---|
 | Raft (Vivek / Amit / Yousuf) | `6001` / `6002` / `6003` |
 | Orders in (Vivek / Amit / Yousuf) | `7001` / `7002` / `7003` |
+| Health probe — witness only (Vivek / Amit / Yousuf) | `6101` / `6102` / `6103` |
 | Sender bind | `9001` |
 | Receiver bind | `8001` |
+| Witness corroboration | `9101` (on the witness machine) |
 
 Open UDP on these ports between all machines.
 
@@ -85,6 +88,7 @@ No machine IPs in source code. Each service loads dotenv:
 | `order-process` | `.env` (active), `.env.example` (localhost), `cluster.sample` (lab IPs) |
 | `order-sending` | `.env`, `.env.example`, `cluster.sample` |
 | `order-receiver` | `.env`, `.env.example` |
+| `order-witness` | `.env` (active), `.env.example` (localhost) |
 
 **Local (one PC, three `order-process` processes)**
 
@@ -112,6 +116,9 @@ cd ../order-receiver && cp .env.example .env
 | `ALLOW_SINGLE_NODE_LEADER` | Alone node may elect + commit | `true` |
 | `PEER_SILENT_MS` | Mark peer “not available” after silence | `2000` |
 | `VERBOSE_RAFT` | Print Raft catch-up spam | `false` |
+| `WITNESS_HOST` / `WITNESS_PORT` | Independent arbiter consulted before single-node self-promotion | — (unset = no witness) |
+| `REQUIRE_WITNESS_FOR_SINGLE_NODE_LEADER` | `false` = legacy blind-timeout self-promotion (no witness needed) | `true` |
+| `NODE1/2/3_HEALTH_PORT` | Liveness-probe port the witness pings (separate from Raft) | 6101 / 6102 / 6103 |
 
 ---
 
@@ -123,6 +130,7 @@ cd ../order-receiver && cp .env.example .env
 cd order-process && cargo build --release
 cd ../order-sending && cargo build --release
 cd ../order-receiver && cargo build --release
+cd ../order-witness && cargo build --release
 ```
 
 ### Multi-machine (recommended)
@@ -151,12 +159,19 @@ Automated performance benchmarking scripts and detailed performance limit report
 
 Detailed metrics, bottleneck analysis ($O(N)$ WAL rewrite, UDP socket buffer overruns, `fsync` overhead), and optimization roadmap are documented in [`docs/BENCHMARK.md`](docs/BENCHMARK.md).
 
-**On Yousuf (receiver + sender):**
+**On Yousuf (receiver + sender + witness):**
 
 ```bash
 cd order-receiver && cargo run --release
 cd order-sending  && cargo run --release
+cd order-witness  && cargo run --release
 ```
+
+`order-witness` needs no `starter.sh` — it's UDP-only, no Aeron/media-driver bootstrap
+required. It does need `cp .env.example .env` (or the real `.env`) with `NODE*_HOST`/
+`NODE*_HEALTH_PORT` matching `order-process`'s exactly. If this machine has never run
+`order-process/starter.sh`, install Rust first: `curl --proto '=https' --tlsv1.2 -sSf
+https://sh.rustup.rs | sh`.
 
 ### What you should see
 
@@ -190,17 +205,48 @@ Leader console also prints `[order] … LEADER received/committed …` lines.
 |---|---|---|
 | 3 | 2 | Normal Raft majority |
 | 2 | 2 | Still need both live nodes to agree |
-| 1 | 1 | Remaining node becomes leader and **can commit alone** after peers silent ≥ `PEER_SILENT_MS` |
+| 1 | 1 | Remaining node becomes leader and **can commit alone**, but only after peers are silent ≥ `PEER_SILENT_MS` **and** `order-witness` corroborates they're genuinely down (see below) |
+
+### Witness-corroborated single-node promotion
+
+A node that can't reach either peer can't tell, from the inside, whether both peers are
+genuinely down or whether *it's* the one that got cut off while its peers formed their
+own quorum. Treating those as the same thing is how split-brain happens — so a local
+timeout alone (`PEER_SILENT_MS`) is never sufficient by itself. Once that timeout
+elapses, the node asks `order-witness` — a separate, non-sequencing process — "can you
+reach my two peers right now?":
+
+- Witness also can't reach them → corroborated → node promotes to `LEADER` (console
+  shows `... witness-corroborated`).
+- Witness *can* reach at least one → node stays passive (`[witness] corroboration
+  denied ...`) — it's the one partitioned, not its peers.
+- Witness itself unreachable, or not configured at all → node stays passive
+  (`[witness] witness unreachable ...` / `no witness configured ...`). Uncertainty
+  always resolves to staying passive, never to promoting.
+
+Set `REQUIRE_WITNESS_FOR_SINGLE_NODE_LEADER=false` to skip this and fall back to the
+old blind-timeout behavior (only `order-process/.env.example`'s local demo does this,
+since it doesn't run a witness by default).
 
 **Failover test**
 
-1. Start all three `order-process` + receiver + sender.  
-2. Note who is `LEADER` in `[role]` lines.  
-3. Stop the leader process.  
-4. Within ~1–2s another node should become `LEADER`; receiver keeps getting orders.  
-5. Stop two nodes: the last one should show the others as `not available`, become `LEADER`, and still send results to S3 (lab single-node mode).
+1. Start all three `order-process` + receiver + sender + `order-witness`.
+2. Note who is `LEADER` in `[role]` lines.
+3. Stop the leader process.
+4. Within ~1–2s another node should become `LEADER`; receiver keeps getting orders.
+5. Stop two nodes: the last one should show the others as `not available`, then (once
+   the witness corroborates they're both down) become `LEADER` — console line will read
+   `... single-node: other machines unreachable, witness-corroborated` — and still send
+   results to S3.
+6. **Split-brain check**: instead of stopping the two peers, leave them running but
+   break only the survivor's *own* view of them (e.g. temporarily point its
+   `NODE*_HOST`/ports for the other two at something unreachable) while leaving the
+   witness's `.env` pointed at their real addresses. The survivor must stay passive
+   (`[witness] corroboration denied ...`) — never `LEADER` — while its two peers keep
+   running their own quorum normally. This proves the witness prevents exactly the
+   split-brain scenario this feature exists for.
 
-Strict production Raft (no single-node) → set `ALLOW_SINGLE_NODE_LEADER=false` (then 1 of 3 **cannot** elect/commit).
+Strict production Raft (no single-node) → set `ALLOW_SINGLE_NODE_LEADER=false` (then 1 of 3 **cannot** elect/commit; the witness is irrelevant in this mode).
 
 ---
 
@@ -244,6 +290,7 @@ Raft keeps logs logically the same via batched `AppendEntries`. If logs diverge 
 | Role shows LEADER but receiver silent | Confirm `S3_HOST`/`S3_PORT`; wait until peers marked not available if testing alone |
 | WAL lengths differ a lot | Catch-up / wipe lagging WALs (see above); ensure latest code |
 | Cross-subnet (e.g. `10.10` vs `172.16`) | All nodes must route to each other; prefer one LAN |
+| Lone node stays passive forever, never becomes `LEADER` | Check `order-witness` is running and reachable (`WITNESS_HOST`/`WITNESS_PORT`), or set `REQUIRE_WITNESS_FOR_SINGLE_NODE_LEADER=false` for the legacy behavior |
 
 ---
 
@@ -253,3 +300,7 @@ Raft keeps logs logically the same via batched `AppendEntries`. If logs diverge 
 - Transport is UDP (lab simplicity, not production messaging).  
 - Default election timeout 300–600 ms; heartbeat 100 ms.  
 - Set `VERBOSE_RAFT=true` only when debugging replication.
+- `order-witness` should run on infrastructure independent of every `order-process`
+  node it watches — if it shares a machine or network path with one of them, a
+  failure there can take out both the node and the witness's ability to corroborate
+  at once, defeating the point. See `order-witness/.env` for current placement.

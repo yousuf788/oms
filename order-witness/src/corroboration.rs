@@ -1,0 +1,136 @@
+// UDP responder for CorroborationRequest from order-process nodes. Answers from the
+// health_poll cache (near-instant) unless the cached entry is stale, in which case it
+// falls back to one fresh synchronous probe rather than answer from outdated data.
+//
+// Decision rule: SafeToPromote iff BOTH of the requester's peers are currently marked
+// unreachable. If either is reachable, PeersStillUp — even one live peer means the
+// "genuine dual failure" precondition doesn't hold, so the isolated node must stay
+// passive. This is the one place that answers the question the whole feature exists
+// to answer, so every request is logged unconditionally (the audit trail).
+
+use crate::config::{config, other_nodes};
+use crate::health_poll::{probe_now, HealthTable, PeerHealth};
+use serde::{Deserialize, Serialize};
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+use std::net::UdpSocket;
+use std::path::PathBuf;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum CorroborationMsg {
+    Request {
+        request_id: u64,
+        requester_id: u8,
+        term: u64,
+    },
+    Response {
+        request_id: u64,
+        peers_checked: Vec<PeerCheck>,
+        verdict: Verdict,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct PeerCheck {
+    node_id: u8,
+    reachable: bool,
+    age_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+enum Verdict {
+    SafeToPromote,
+    PeersStillUp,
+}
+
+fn now_ms() -> u128 {
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)
+}
+
+fn log_path() -> PathBuf {
+    PathBuf::from("logs").join("corroboration.log")
+}
+
+fn append_log(line: &str) {
+    let path = log_path();
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(&path) {
+        let _ = writeln!(f, "{line}");
+    }
+}
+
+pub fn start_corroboration_responder(table: HealthTable) {
+    let cfg = config();
+    let socket = UdpSocket::bind((cfg.bind_host.as_str(), cfg.witness_port))
+        .expect("failed to bind witness corroboration responder");
+    println!(
+        "[witness] listening for corroboration requests on {}:{}",
+        cfg.bind_host, cfg.witness_port
+    );
+
+    let stale_after = Duration::from_millis(cfg.poll_interval_ms.saturating_mul(2));
+    let probe_timeout = Duration::from_millis(cfg.probe_timeout_ms);
+    let mut buf = [0u8; 1024];
+
+    loop {
+        let (n, src) = match socket.recv_from(&mut buf) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let Ok(CorroborationMsg::Request { request_id, requester_id, term }) =
+            serde_json::from_slice::<CorroborationMsg>(&buf[..n])
+        else {
+            continue; // garbage/unrecognized packet — silently ignored
+        };
+
+        let start = Instant::now();
+        let peers = other_nodes(requester_id);
+        let mut checks = Vec::with_capacity(peers.len());
+        for peer in &peers {
+            let cached = table.lock().unwrap().get(&peer.id).copied();
+            let (reachable, age_ms) = match cached {
+                Some(PeerHealth { reachable, last_seen }) if last_seen.elapsed() < stale_after => {
+                    (reachable, last_seen.elapsed().as_millis() as u64)
+                }
+                _ => {
+                    // Cache missing or stale — one fresh probe rather than a guess.
+                    (probe_now(&peer.host, peer.health_port, probe_timeout), 0)
+                }
+            };
+            checks.push(PeerCheck { node_id: peer.id, reachable, age_ms });
+        }
+
+        let verdict = if checks.iter().all(|c| !c.reachable) {
+            Verdict::SafeToPromote
+        } else {
+            Verdict::PeersStillUp
+        };
+
+        append_log(&format!(
+            "{},{},{},{},{},{}",
+            now_ms(),
+            request_id,
+            requester_id,
+            term,
+            checks
+                .iter()
+                .map(|c| format!("{}:{}:{}ms", c.node_id, if c.reachable { "up" } else { "down" }, c.age_ms))
+                .collect::<Vec<_>>()
+                .join("|"),
+            format!("{verdict:?}"),
+        ));
+        println!(
+            "[witness] corroboration request from node {requester_id} (term {term}) -> {verdict:?} ({}ms)",
+            start.elapsed().as_millis()
+        );
+
+        let response = CorroborationMsg::Response { request_id, peers_checked: checks, verdict };
+        if let Ok(payload) = serde_json::to_vec(&response) {
+            let _ = socket.send_to(&payload, src);
+        }
+    }
+}

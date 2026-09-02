@@ -8,18 +8,21 @@ NODE1_NAME=Vivek
 NODE1_HOST=172.16.12.104
 NODE1_RAFT_PORT=6001
 NODE1_ORDER_PORT=7001
+NODE1_HEALTH_PORT=6101
 
 # ---- Node 2 (Amit) ----
 NODE2_NAME=Amit
 NODE2_HOST=172.16.13.181
 NODE2_RAFT_PORT=6002
 NODE2_ORDER_PORT=7002
+NODE2_HEALTH_PORT=6102
 
 # ---- Node 3 (Yousuf) ----
 NODE3_NAME=Yousuf
 NODE3_HOST=172.16.12.252
 NODE3_RAFT_PORT=6003
 NODE3_ORDER_PORT=7003
+NODE3_HEALTH_PORT=6103
 
 # order-receiver on Yousuf (same host as node 3)
 S3_HOST=172.16.12.252
@@ -29,6 +32,15 @@ HEARTBEAT_INTERVAL_MS=100
 ELECTION_TIMEOUT_MIN_MS=300
 ELECTION_TIMEOUT_MAX_MS=600
 
-# Lab failover: remaining node becomes leader if peers silent this long (ms)
+# Lab failover: remaining node becomes leader if peers silent this long (ms) AND
+# order-witness corroborates that both peers are genuinely unreachable.
 ALLOW_SINGLE_NODE_LEADER=true
 PEER_SILENT_MS=2000
+
+# Run order-witness on independent infrastructure (not one of the 3 nodes above) —
+# see order-witness/.env.example. Must match its NODE*_HOST/_HEALTH_PORT exactly.
+WITNESS_HOST=<witness machine IP>
+WITNESS_PORT=9101
+WITNESS_TIMEOUT_MS=1500
+WITNESS_RETRY_INTERVAL_MS=2000
+REQUIRE_WITNESS_FOR_SINGLE_NODE_LEADER=true

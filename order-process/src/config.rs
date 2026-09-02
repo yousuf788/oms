@@ -111,7 +111,7 @@ fn load_from_env() -> ClusterConfig {
         allow_single_node_leader: env_bool("ALLOW_SINGLE_NODE_LEADER", true),
         peer_silent_ms: env_u64("PEER_SILENT_MS", 2000),
         witness_host: env::var("WITNESS_HOST").ok(),
-        witness_port: env_u16("WITNESS_PORT", 9001),
+        witness_port: env_u16("WITNESS_PORT", 9101),
         witness_timeout_ms: env_u64("WITNESS_TIMEOUT_MS", 1500),
         witness_retry_interval_ms: env_u64("WITNESS_RETRY_INTERVAL_MS", 2000),
         require_witness_for_single_node_leader: env_bool(

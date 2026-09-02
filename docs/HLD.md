@@ -249,17 +249,76 @@ If **both Server 2 and Server 3 go offline**, and only Server 1 is running:
 ```
 Configuration: ALLOW_SINGLE_NODE_LEADER=true
                PEER_SILENT_MS=2000ms
+               REQUIRE_WITNESS_FOR_SINGLE_NODE_LEADER=true
+               WITNESS_HOST=<order-witness machine>
 ```
 
-- After **2000ms** of silence from all peers, Server 1 detects it is alone.
-- Server 1 promotes itself with **quorum = 1** (single-node cluster).
-- Orders continue to be processed and committed to Server 1's WAL.
-- Results are sent to S3 as normal.
+- After **2000ms** of silence from all peers, Server 1 detects it is *locally* isolated.
+- A local timeout alone is **not** sufficient grounds to promote — Server 1 cannot tell,
+  from the inside, whether Server 2 and Server 3 are genuinely down or whether it's the
+  one that got partitioned while they formed their own quorum between themselves.
+  Treating those two cases the same is how split-brain happens. See §6.1.
+- Server 1 asks the independent **witness** service (`order-witness`, §6.1) whether it
+  can reach Server 2 and Server 3. Only if the witness also can't reach them does
+  Server 1 promote itself with **quorum = 1** (single-node cluster).
+- If the witness reports either peer is actually reachable — or the witness itself is
+  unreachable — Server 1 **stays passive**: it keeps accepting/queuing orders on its
+  Aeron subscription but does not process, commit, or send results. Uncertainty always
+  resolves to caution, never to promotion.
+- Once corroborated and promoted: orders continue to be processed and committed to
+  Server 1's WAL, and results are sent to S3 as normal.
 
 When Server 2 or Server 3 comes back online:
 - They initiate an election (they've been accumulating terms while offline).
 - Server 1's **log dominance** means reconnecting nodes will catch up via `AppendEntries` replication.
 - Server 1 stays leader (no unnecessary re-election).
+
+Setting `REQUIRE_WITNESS_FOR_SINGLE_NODE_LEADER=false` restores the original
+blind-timeout behavior (no witness consulted) — used only by the single-machine local
+demo, which doesn't run a witness process by default.
+
+### 6.1 Witness Corroboration
+
+A new, independent, **non-sequencing** service, `order-witness`, exists solely to answer
+one question for an isolated `order-process` node: *"can you reach my two peers right
+now?"* It never processes orders, never holds Raft/consensus state, and never becomes
+leader itself.
+
+```
+order-process node (locally isolated, PEER_SILENT_MS elapsed)
+         │
+         ▼
+   send CorroborationRequest { requester_id, term } ──UDP──► order-witness
+         │                                                        │
+         │                                          independently pings the
+         │                                          requester's two peers on
+         │                                          their dedicated HEALTH_PORT
+         │                                          (never the Raft port)
+         │                                                        │
+         │◄──UDP── CorroborationResponse { verdict } ─────────────┘
+         ▼
+   SafeToPromote  → node promotes to LEADER (quorum = 1)
+   PeersStillUp   → node stays passive (it is the one partitioned)
+   (no response / timeout) → node stays passive (fail-safe default)
+```
+
+- **Health probe port**: each `order-process` node runs a trivial, stateless UDP
+  responder on `NODE{n}_HEALTH_PORT` (6101/6102/6103 by default) — completely separate
+  from the Raft control port (6001/6002/6003), so a witness probe can never be
+  misread as a Raft message or perturb consensus state.
+- **Decision rule** (witness-side): `SafeToPromote` iff **both** of the requester's
+  peers are currently unreachable. If either is reachable, `PeersStillUp` — one live
+  peer is enough to mean the "genuine dual failure" precondition doesn't hold.
+- **Corroboration timeout**: bounded at `WITNESS_TIMEOUT_MS` (default 1500ms). No
+  response within that window is treated identically to `PeersStillUp` — never guessed
+  as safe.
+- **Placement**: the witness must run on infrastructure that fails independently of the
+  `order-process` nodes it watches — co-locating it with one of them defeats the
+  purpose (a machine failure would take out both the node and the ability to
+  corroborate its isolation at the same time). In this lab's 3-machine layout, the
+  witness runs on Yousuf's machine.
+- **Audit trail**: every corroboration request/response and every reachability state
+  change is logged to flat files under `order-witness/logs/` (see §10).
 
 ---
 
@@ -326,6 +385,10 @@ When Server 2 or Server 3 comes back online:
 | `ELECTION_TIMEOUT_MAX_MS` | 300ms | Latest a follower starts an election |
 | `PEER_SILENT_MS` | 2000ms | Time before a peer is marked "unavailable" |
 | `ALLOW_SINGLE_NODE_LEADER` | true | Server 1 can self-elect if both others are down |
+| `REQUIRE_WITNESS_FOR_SINGLE_NODE_LEADER` | true | Single-node self-election requires witness corroboration (§6.1); `false` = legacy blind timeout |
+| `WITNESS_HOST` / `WITNESS_PORT` | — / 9101 | Address of the `order-witness` service |
+| `WITNESS_TIMEOUT_MS` | 1500ms | Max wait for witness corroboration before staying passive |
+| `NODE1/2/3_HEALTH_PORT` | 6101/6102/6103 | Liveness-probe ports the witness pings (separate from Raft) |
 | `TARGET_TPS` | 5000 | Orders per second sent by order-sending |
 | Aeron Order Stream | 1001 | Logical stream ID for order messages |
 | Aeron Result Stream | 2001 | Logical stream ID for result messages |
@@ -339,10 +402,13 @@ When Server 2 or Server 3 comes back online:
 | Server 1 order-process restarts | Server 2 or Server 3 elected leader in 150–300ms | 0 | ~200ms |
 | Server 2 goes offline | Server 1 + Server 3 maintain quorum, no election | 0 | 0ms |
 | Server 3 goes offline | Server 1 + Server 2 maintain quorum, no election | 0 | 0ms |
-| Server 2 + Server 3 both offline | Server 1 self-elects after 2000ms (`PEER_SILENT_MS`) | 0 | ~2000ms |
+| Server 2 + Server 3 both offline | Server 1 self-elects after 2000ms (`PEER_SILENT_MS`) **and** witness corroboration (§6.1) | 0 | ~2000ms + witness round-trip |
+| Server 2 + Server 3 alive, but Server 1 partitioned from them | Server 1 stays passive (witness reports peers reachable) — no split-brain | 0 | N/A (queues, doesn't process) |
+| Witness unreachable while Server 1 is isolated | Server 1 stays passive (fail-safe default) | 0 | N/A (queues, doesn't process) |
 | All 3 nodes offline | No leader — orders queue in Aeron buffers | 0 (buffered) | Until 1 node returns |
 | order-sending restarts | Aeron reconnects automatically | 0 | <1s reconnect |
 | order-receiver restarts | Aeron reconnects, WAL intact on S2 | 0 | <1s reconnect |
+| order-witness restarts | No effect on quorum-based election (3 or 2 live nodes); only single-node self-promotion is gated | 0 | N/A |
 
 ---
 
@@ -355,3 +421,5 @@ When Server 2 or Server 3 comes back online:
 | `order-process/logs/orders-processed-s2-1.log` | Server 2 (Node 1) | Replica WAL |
 | `order-process/logs/orders-processed-s2-2.log` | Server 3 (Node 2) | Replica WAL |
 | `order-receiver/logs/orders-received.log` | Server 1 | Results received by S3 |
+| `order-witness/logs/health-transitions.log` | Witness machine | Reachability state changes for each watched node |
+| `order-witness/logs/corroboration.log` | Witness machine | Every corroboration request + verdict (audit trail) |
