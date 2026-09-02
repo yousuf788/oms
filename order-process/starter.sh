@@ -105,8 +105,34 @@ if [[ $# -ge 1 ]]; then
   export NODE_ID
   echo "[starter] Starting order-process with NODE_ID=$NODE_ID"
 else
-  unset NODE_ID || true
-  echo "[starter] Starting order-process (NODE_ID auto-detect from local IP)"
+  # Auto-detect: if all 3 NODE*_HOST values are the same (single-machine/localhost
+  # demo), the Rust IP-match logic finds all 3 and panics. In that case, pick the
+  # first node whose RAFT port is NOT already bound — that's the next free slot.
+  H1="${NODE1_HOST:-127.0.0.1}"
+  H2="${NODE2_HOST:-127.0.0.1}"
+  H3="${NODE3_HOST:-127.0.0.1}"
+
+  if [[ "$H1" == "$H2" && "$H2" == "$H3" ]]; then
+    NODE_ID=""
+    for try_id in 1 2 3; do
+      port_var="NODE${try_id}_RAFT_PORT"
+      port="${!port_var:-$((6000 + try_id))}"
+      if ! ss -tulnp 2>/dev/null | grep -q ":${port} "; then
+        NODE_ID="$try_id"
+        break
+      fi
+    done
+    if [[ -z "$NODE_ID" ]]; then
+      echo "[starter] All 3 raft ports already in use. Are all 3 nodes already running?"
+      exit 1
+    fi
+    export NODE_ID
+    echo "[starter] Auto-assigned NODE_ID=$NODE_ID (first free raft port on localhost)"
+  else
+    # Multi-machine mode: let Rust auto-detect from local IP vs NODE*_HOST
+    unset NODE_ID || true
+    echo "[starter] Starting order-process (NODE_ID auto-detect from local IP)"
+  fi
 fi
 
 # ── 7. Build + run latest code ───────────────────────────────────────────────

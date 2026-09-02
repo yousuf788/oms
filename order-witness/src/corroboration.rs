@@ -5,7 +5,7 @@
 // Security: every inbound request must carry a valid HMAC-SHA256 tag signed with
 // WITNESS_HMAC_KEY. Unauthenticated packets are dropped without a response.
 // Every outbound response is also signed so order-process nodes can verify it.
-
+use crate::auth;
 use crate::config::{config, find_node, other_nodes};
 use crate::health_poll::{probe_now, HealthTable, PeerHealth};
 use serde::{Deserialize, Serialize};
