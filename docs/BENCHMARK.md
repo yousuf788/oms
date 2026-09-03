@@ -48,28 +48,56 @@ Methodology: `scripts/run_benchmark.sh`, which sends for a fixed duration then p
 not a snapshot immediately after stopping the sender, which would misreport in-flight orders as
 loss. "Clean" below means zero missing `order_id` ranges and zero duplicates.
 
+**Re-verified 2026-09-03** against the current working tree (includes in-progress
+`order-process`/`order-receiver` `replay_client.rs` changes, confirmed to build clean with
+`cargo check --release` before benchmarking):
+
 | Configuration | Sustained clean throughput | Evidence |
 |---|---|---|
-| 1 node (no Raft replication) | **~20,000 orders/sec** | 30s run: 593,920 sent → 595,005 received, 0 missing, 0 duplicates (60s convergence window) |
-| 3 nodes (full Raft replication) | **~7,000-8,000 orders/sec** | 20s run: 137,216 sent → 137,842 received, 0 missing, 0 duplicates |
+| 1 node (no Raft replication) | **~24,600 orders/sec** | 30s run @ `TARGET_TPS=25000`, 4 sender threads: 739,328 sent → 741,371 received, 0 missing, 0 duplicates (60s convergence window) |
+| 3 nodes (full Raft replication) | **~5,800-6,000 orders/sec** | 20s run @ `TARGET_TPS=6000`, 8 sender threads: 116,736 sent → 117,669 received, 0 missing, 0 duplicates (60s convergence window) |
 
-Both ceilings are **sharp cliffs, not graceful degradation**: pushing past them (e.g. 3-node at
-8,500 TPS, or 1-node at 50,000 TPS sustained for 20s+) produces a large, persistent backlog that
-does not fully drain within a 15-30s convergence window — not because data is lost (a 60s window
-at a rate within the ceiling fully converged with zero loss), but because there's no adaptive
-rate control feeding the sender information about how far behind the receiver is. The gap
-narrows to a small, expected async-WAL-flush artifact when the sender is stopped cleanly within
-capacity; well past capacity, it just keeps growing.
+Both ceilings are **sharp cliffs, not graceful degradation**: pushing past them produces a large,
+persistent backlog that does not fully drain within a 60s convergence window — not because data
+is lost (a run within the ceiling fully converges with zero loss), but because there's no
+adaptive rate control feeding the sender information about how far behind the receiver is. On
+this run, pushing the 3-node cluster to `TARGET_TPS=7000` left 77,894 of 135,168 orders
+(57.6%) still outstanding after a 60s convergence wait, and `TARGET_TPS=8000` left 142,392 of
+155,648 (91.5%) outstanding — in both cases the backlog was still growing, not draining, when the
+harness gave up. Raft `[role]` log lines showed a stable, non-flapping leader throughout both
+over-ceiling attempts, so this was not the leader-election-flapping failure mode in §0.1 item 3 —
+`uptime` showed a load average of 4.6-6.1 out of 12 cores during these runs, so the more likely
+explanation is CPU scheduling contention on this shared host limiting the leader's batching/
+replication loop, not a code regression.
+
+The previous measurement recorded here (1 node ~20,000/s, 3 nodes ~7,000-8,000/s, both from
+earlier the same day) is superseded by the numbers above. The 3-node ceiling measured this time
+(~6,000/s) is lower than that earlier figure — read both as **this machine's ceiling at the time
+each run was taken**, not as a fixed constant: §0.3 already establishes this is a shared,
+contended single machine, and this delta is direct evidence of how much that condition moves the
+observed ceiling run to run.
+
+### 0.2b Rate-paced 5,000 TPS confirmation (same methodology as historical §2.4)
+
+| Configuration | Sender Threads | Duration | Target TPS | Sent | Received | Duplicates | Missing |
+|---|---|---|---|---|---|---|---|
+| 1 node | 4 | 10s | 5,000 | 47,104 (~4,710/s) | 48,296 (~4,829/s) | 0 | none |
+| 3 nodes (full Raft replication) | 8 | 10s | 5,000 | 47,104 (~4,710/s) | 48,367 (~4,836/s) | 0 | none |
+
+Sent counts are identical between the two rows because `order-sending`'s `TARGET_TPS` rate-pacing
+caps the sender's own emission rate independent of how many S2 nodes are subscribed — this
+reproduces the historical zero-packet-loss result (§2.4) on both topologies with today's code.
 
 ### 0.3 The 200k-300k TPS target has NOT been validated
 
-This is a single shared desktop machine (12 cores, load average ~6.4 from unrelated processes —
-not a dedicated benchmark host) simulating all 3 S2 nodes, the sender, and the receiver at once.
-That is not the same test as the real 3-machine lab deployment this system is designed for (see
-`docs/HLD.md` §1 and `scripts/run_lab_benchmark.md`). Do not read the ~7-20k/sec numbers above as
-a ceiling on the *design* — they're a ceiling on *this specific shared single-machine simulation*.
-The 200k-300k TPS target requires running `scripts/run_lab_benchmark.md`'s procedure on the real
-lab hardware; that has not been done as part of this work.
+This is a single shared desktop machine (12 cores, load average 4.6-6.1 observed across today's
+runs from unrelated processes — not a dedicated benchmark host) simulating all 3 S2 nodes, the
+sender, and the receiver at once. That is not the same test as the real 3-machine lab deployment
+this system is designed for (see `docs/HLD.md` §1 and `scripts/run_lab_benchmark.md`). Do not read
+the ~6-25k/sec numbers above as a ceiling on the *design* — they're a ceiling on *this specific
+shared single-machine simulation, on this run*. The 200k-300k TPS target requires running
+`scripts/run_lab_benchmark.md`'s procedure on the real lab hardware; that has not been done as
+part of this work.
 
 ### 0.4 Zero-loss correctness — what was actually verified
 

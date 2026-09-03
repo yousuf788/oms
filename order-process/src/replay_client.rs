@@ -14,6 +14,16 @@
 // Backoff: repeated requests for a still-outstanding range back off
 // exponentially up to MAX_BACKOFF, so a prolonged outage doesn't turn into
 // a tight request loop.
+//
+// Debounce/backoff state is keyed by the range's `from` (start), NOT the
+// full `(from, to)` tuple. While the sender is still actively producing,
+// `to` (the highest order_id seen so far) grows every tick — keying by the
+// full tuple made every tick look like a brand-new range and reset the
+// debounce timer continuously, so a request could be starved indefinitely
+// under sustained live traffic (it only ever fired once traffic paused
+// long enough for `to` to stop moving). `from` only changes once that
+// specific gap has actually been partially filled, which is genuine
+// progress worth a fresh debounce — not starvation.
 
 use crate::auth;
 use crate::sequence_tracker::SequenceTracker;
@@ -66,37 +76,38 @@ pub fn start_replay_client(
             );
         }
 
-        let mut first_seen: HashMap<(u64, u64), Instant> = HashMap::new();
-        let mut next_retry: HashMap<(u64, u64), Instant> = HashMap::new();
-        let mut backoff: HashMap<(u64, u64), Duration> = HashMap::new();
+        let mut first_seen: HashMap<u64, Instant> = HashMap::new();
+        let mut next_retry: HashMap<u64, Instant> = HashMap::new();
+        let mut backoff: HashMap<u64, Duration> = HashMap::new();
 
         loop {
             thread::sleep(TICK);
 
             let ranges = { tracker.lock().unwrap().missing_ranges() };
             let now = Instant::now();
-            let live: HashSet<(u64, u64)> = ranges.iter().copied().collect();
+            let live: HashSet<u64> = ranges.iter().map(|(from, _)| *from).collect();
             first_seen.retain(|k, _| live.contains(k));
             next_retry.retain(|k, _| live.contains(k));
             backoff.retain(|k, _| live.contains(k));
 
             let mut due: Vec<(u64, u64)> = Vec::new();
             for range in ranges {
-                let seen_at = *first_seen.entry(range).or_insert(now);
+                let key = range.0;
+                let seen_at = *first_seen.entry(key).or_insert(now);
                 if now.duration_since(seen_at) < DEBOUNCE {
                     continue; // give reordering a chance to resolve itself first
                 }
-                let retry_at = *next_retry.entry(range).or_insert(now);
+                let retry_at = *next_retry.entry(key).or_insert(now);
                 if now < retry_at {
                     continue;
                 }
                 due.push(range);
                 let next_backoff = backoff
-                    .get(&range)
+                    .get(&key)
                     .map(|d| (*d * 2).min(MAX_BACKOFF))
                     .unwrap_or(INITIAL_BACKOFF);
-                backoff.insert(range, next_backoff);
-                next_retry.insert(range, now + next_backoff);
+                backoff.insert(key, next_backoff);
+                next_retry.insert(key, now + next_backoff);
             }
 
             if due.is_empty() {

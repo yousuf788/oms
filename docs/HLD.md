@@ -69,8 +69,8 @@ All inter-service communication uses **Aeron**, a high-performance messaging sys
 | Delivery guarantee | ✅ NAK-based retransmit |
 | Backpressure | ✅ `offer()` blocks on retry |
 | Ordering | ✅ In-order per stream |
-| Throughput | 500K–10M msgs/sec |
-| Latency | <20µs (UDP), <1µs (IPC) |
+| Throughput | 500K–10M msgs/sec (Aeron's own vendor-stated transport ceiling — not a number this system has measured; see §9.1) |
+| Latency | <20µs (UDP), <1µs (IPC) (Aeron's own vendor-stated figures) |
 
 **How Aeron works:**
 Every machine runs an **Aeron Media Driver** — a lightweight Java daemon that manages shared memory ring buffers and handles UDP I/O. Rust services connect to this driver via shared memory (IPC) and don't touch the network directly.
@@ -523,7 +523,7 @@ Both were found and fixed during the load-testing effort documented in `docs/BEN
 
 ### 9.1 Measured throughput vs. the 300k target
 
-`TARGET_TPS=300000` is the *design target*, not a validated result. On a single shared machine simulating all 3 S2 nodes plus sender and receiver (i.e. `scripts/run_benchmark.sh`, not the real 3-machine lab deployment), measured sustained throughput with zero missing orders and zero duplicates was **~20,000 orders/sec with 1 node** and **~7,000-8,000 orders/sec with the full 3-node Raft cluster** — see `docs/BENCHMARK.md` for the full results and methodology. The 200k-300k TPS target has not been validated end-to-end; that requires the real multi-machine deployment this document describes (`scripts/run_lab_benchmark.md`), since a single shared machine can't give each Raft node dedicated CPU the way the tuned 50ms/150-300ms heartbeat/election timings assume.
+`TARGET_TPS=300000` is the *design target*, not a validated result — and it is itself an order of magnitude below the current 500K–2M orders/sec design target under active evaluation (see `docs/BENCHMARK.md` §0.3). On a single shared machine simulating all 3 S2 nodes plus sender and receiver (i.e. `scripts/run_benchmark.sh`, not the real 3-machine lab deployment), the most recently re-verified measured sustained throughput with zero missing orders and zero duplicates was **~24,600 orders/sec with 1 node** and **~5,800-6,000 orders/sec with the full 3-node Raft cluster** — see `docs/BENCHMARK.md` §0.2 for the full results and methodology. Neither the 200k-300k TPS target nor the 500K–2M orders/sec target has been validated end-to-end; both require the real multi-machine deployment this document describes (`scripts/run_lab_benchmark.md`), since a single shared machine can't give each Raft node dedicated CPU the way the tuned 50ms/150-300ms heartbeat/election timings assume — and, independent of hardware, the current single-threaded propose-then-wait-for-quorum-commit design in `order-process` (nothing pipelines batch N+1's build against batch N's commit) is architecturally why 3-node throughput is *lower* than 1-node, not just slower.
 
 ---
 

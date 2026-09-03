@@ -194,7 +194,13 @@ fn main() {
                         result.status, result.filled_qty, result.processed_by,
                         result.term, received_ts_ms,
                     );
-                    let _ = log_tx.try_send(line);
+                    // Blocking, not try_send: mark() above already recorded this
+                    // order_id as seen, so a dropped send here would be permanently
+                    // invisible to gap detection/replay — same invariant as
+                    // order-process's poll_tx.send() (see its main.rs for the full
+                    // rationale). Backpressure here naturally throttles Aeron
+                    // fragment consumption instead of silently losing the order.
+                    let _ = log_tx.send(line);
                     received_total.fetch_add(1, Ordering::Relaxed);
                 }
             }, 256)
