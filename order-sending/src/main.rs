@@ -194,29 +194,25 @@ fn main() {
             // so a node that never connects (or drops mid-stream) just loses
             // this one message instead of wedging the whole pipeline.
             const MAX_BACKPRESSURE_RETRIES: u32 = 100_000;
-            let mut idle = BusySpinIdleStrategy::default();
-            loop {
-                match node_rx.recv() {
-                    Ok(frame) => {
-                        let mut retries = 0u32;
-                        loop {
-                            match pub_.offer(frame.as_slice()) {
-                                Ok(_) => break,
-                                Err(e) if e.is_retryable() && retries < MAX_BACKPRESSURE_RETRIES => {
-                                    retries += 1;
-                                    idle.idle(0);
-                                    continue;
-                                }
-                                Err(e) => {
-                                    eprintln!("[order-sending] publish error (node {}): {e}", i + 1);
-                                    break;
-                                }
-                            }
+            let mut idle = BusySpinIdleStrategy;
+            while let Ok(frame) = node_rx.recv() {
+                let mut retries = 0u32;
+                loop {
+                    match pub_.offer(frame.as_slice()) {
+                        Ok(_) => break,
+                        Err(e) if e.is_retryable() && retries < MAX_BACKPRESSURE_RETRIES => {
+                            retries += 1;
+                            idle.idle(0);
+                            continue;
+                        }
+                        Err(e) => {
+                            eprintln!("[order-sending] publish error (node {}): {e}", i + 1);
+                            break;
                         }
                     }
-                    Err(_) => break, // fan-out thread exited
                 }
             }
+            // node_rx.recv() returning Err means the fan-out thread exited.
         });
     }
 
@@ -244,40 +240,36 @@ fn main() {
     let fanout_handle = {
         let log_tx = log_tx.clone();
         thread::spawn(move || {
-            loop {
-                match payload_rx.recv() {
-                    Ok(order) => {
-                        let Ok(encoded) = bincode::serialize(&order) else { continue };
-                        let frame = Arc::new(auth::sign(&encoded));
-                        for node_tx in &node_channels {
-                            // Non-blocking: a node with no live subscriber (or
-                            // genuinely backpressured) must not stall delivery
-                            // to the other two — that's the whole reason this
-                            // file uses one channel/thread per node (see the
-                            // header comment). Skipping this node for this one
-                            // order is safe because the order is already
-                            // durable in this process's WAL (appended via
-                            // log_tx below): that node's own ingest-side
-                            // sequence tracker will notice the resulting gap
-                            // and pull it back via REPLAY_REQUEST once it can
-                            // process again (see replay.rs / order-process's
-                            // replay_client.rs).
-                            match node_tx.try_send(Arc::clone(&frame)) {
-                                Ok(_) => {}
-                                Err(mpsc::TrySendError::Full(_)) => {}
-                                Err(mpsc::TrySendError::Disconnected(_)) => return,
-                            }
-                        }
-                        // Blocking, not try_send: never silently drop the
-                        // durability record for an order that was just
-                        // handed to the publisher threads.
-                        if log_tx.send(order).is_err() {
-                            return; // WAL writer thread exited
-                        }
+            while let Ok(order) = payload_rx.recv() {
+                let Ok(encoded) = bincode::serialize(&order) else { continue };
+                let frame = Arc::new(auth::sign(&encoded));
+                for node_tx in &node_channels {
+                    // Non-blocking: a node with no live subscriber (or
+                    // genuinely backpressured) must not stall delivery
+                    // to the other two — that's the whole reason this
+                    // file uses one channel/thread per node (see the
+                    // header comment). Skipping this node for this one
+                    // order is safe because the order is already
+                    // durable in this process's WAL (appended via
+                    // log_tx below): that node's own ingest-side
+                    // sequence tracker will notice the resulting gap
+                    // and pull it back via REPLAY_REQUEST once it can
+                    // process again (see replay.rs / order-process's
+                    // replay_client.rs).
+                    match node_tx.try_send(Arc::clone(&frame)) {
+                        Ok(_) => {}
+                        Err(mpsc::TrySendError::Full(_)) => {}
+                        Err(mpsc::TrySendError::Disconnected(_)) => return,
                     }
-                    Err(_) => break, // all generator threads exited
+                }
+                // Blocking, not try_send: never silently drop the
+                // durability record for an order that was just
+                // handed to the publisher threads.
+                if log_tx.send(order).is_err() {
+                    return; // WAL writer thread exited
                 }
             }
+            // payload_rx.recv() returning Err means all generator threads exited.
         })
     };
 

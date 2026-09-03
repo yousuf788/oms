@@ -153,10 +153,10 @@ fn local_ipv4_addrs() -> Vec<String> {
             }
         }
     }
-    // Loopback for single-machine .env.example demos
-    if ips.is_empty() {
-        ips.push("127.0.0.1".to_string());
-    } else if !ips.iter().any(|ip| ip == "127.0.0.1") {
+    // Loopback for single-machine .env.example demos — covers both the
+    // empty case and "present but missing 127.0.0.1" in one check, since
+    // `any()` on an empty iterator is already `false`.
+    if !ips.iter().any(|ip| ip == "127.0.0.1") {
         ips.push("127.0.0.1".to_string());
     }
     ips

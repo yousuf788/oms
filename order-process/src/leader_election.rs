@@ -5,7 +5,7 @@ use crate::config::{
     require_monitoring_for_single_node_leader, s2_nodes, verbose_raft, S2Node,
 };
 use crate::wal::{LogEntry, ReplicatedCommand, Wal};
-use crate::monitoring_client::{CachedVerdict, CorroborationOutcome, monitoringClient};
+use crate::monitoring_client::{CachedVerdict, CorroborationOutcome, MonitoringClient};
 use rand::Rng;
 use rusteron_client::{AeronPublication, BusySpinIdleStrategy, IdleStrategy};
 use serde::{Deserialize, Serialize};
@@ -146,7 +146,7 @@ pub struct LeaderElection {
     /// Independent-monitoring corroboration client — see `monitoring_loop()` and
     /// `peers_unreachable()`. A local isolation timeout is never sufficient on
     /// its own to justify self-promotion; this is what corroborates it.
-    monitoring: monitoringClient,
+    monitoring: MonitoringClient,
 }
 
 impl LeaderElection {
@@ -213,7 +213,7 @@ impl LeaderElection {
             is_leader_flag: AtomicBool::new(false),
             allowed_ips,
             started_at: Instant::now(),
-            monitoring: monitoringClient::new(),
+            monitoring: MonitoringClient::new(),
         });
 
         println!(
@@ -285,7 +285,7 @@ impl LeaderElection {
     }
 
     fn result_publisher_loop(&self, result_pub: AeronPublication, replay_rx: Receiver<(u64, u64)>) {
-        let mut idle = BusySpinIdleStrategy::default();
+        let mut idle = BusySpinIdleStrategy;
         let mut last_published: u64 = 0;
         loop {
             if !self.is_leader() {
@@ -630,7 +630,7 @@ impl LeaderElection {
                     CorroborationOutcome::DeniedBymonitoring => println!(
                         "[monitoring] corroboration denied: monitoring reports a peer still reachable — {name} staying passive"
                     ),
-                    CorroborationOutcome::monitoringUnreachable => println!(
+                    CorroborationOutcome::MonitoringUnreachable => println!(
                         "[monitoring] monitoring unreachable after {}ms — {name} staying passive",
                         crate::config::monitoring_timeout_ms()
                     ),
@@ -651,7 +651,7 @@ impl LeaderElection {
             1
         } else {
             // Standard Raft majority of the full cluster.
-            (self.peers.len() + 1) / 2 + 1
+            self.peers.len().div_ceil(2) + 1
         }
     }
 
@@ -661,7 +661,7 @@ impl LeaderElection {
     /// displaced by a RequestVote from a stale/reconnecting node.
     fn has_quorum_lease(&self, st: &RaftState) -> bool {
         let lease_window = Duration::from_millis(heartbeat_interval_ms() * 4);
-        let quorum_needed = (self.peers.len() + 1) / 2 + 1; // majority of full cluster
+        let quorum_needed = self.peers.len().div_ceil(2) + 1; // majority of full cluster
         // Count self + peers that acked within the lease window.
         let recent_acks = 1 + self
             .peers

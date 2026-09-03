@@ -17,7 +17,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub const HMAC_TAG_LEN: usize = 32;
 pub const LEN_PREFIX: usize = 4;
 
-static monitoring_KEY: OnceLock<Vec<u8>> = OnceLock::new();
+static MONITORING_KEY: OnceLock<Vec<u8>> = OnceLock::new();
 
 fn decode_hex_key(hex: &str, env_name: &str) -> Vec<u8> {
     if hex.len() < 32 {
@@ -38,7 +38,7 @@ fn decode_hex_key(hex: &str, env_name: &str) -> Vec<u8> {
 }
 
 pub fn monitoring_key() -> &'static [u8] {
-    monitoring_KEY.get_or_init(|| {
+    MONITORING_KEY.get_or_init(|| {
         let hex = std::env::var("monitoring_HMAC_KEY")
             .expect("monitoring_HMAC_KEY must be set (hex-encoded ≥32-byte key). Generate: openssl rand -hex 32");
         decode_hex_key(&hex, "monitoring_HMAC_KEY")

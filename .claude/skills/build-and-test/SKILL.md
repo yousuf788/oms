@@ -30,12 +30,22 @@ cd /data/Antier-project/Exchange/oms/order-monitoring && cargo clippy --all-targ
 ```
 
 > [!NOTE]
-> As of this writing, `order-process`, `order-sending`, and `order-monitoring` each have a
-> handful of **pre-existing** `-D warnings` violations (naming-convention issues from the
-> order-witness→order-monitoring rename's inconsistent casing, plus a couple of unrelated style
-> lints in `order-process/src/wal.rs`) that predate the sequencing/replay work. `order-receiver`
-> is clean. Don't assume a clippy failure in those three crates is something you just broke —
-> check `git blame`/diff the specific flagged lines before treating it as a regression.
+> All four crates are warning-free under plain `cargo build` and clean under
+> `cargo clippy --all-targets -- -D warnings` as of this writing. This includes the
+> order-witness→order-monitoring rename's naming-convention warnings (`monitoringConfig`,
+> `monitoring_KEY`, `monitoringClient`, `monitoringUnreachable`) and a batch of unrelated
+> pre-existing clippy-only lints (`div_ceil`, `len_without_is_empty`, `explicit_counter_loop`,
+> `while_let_loop`, `default_constructed_unit_structs`, `new_without_default`, `identical_blocks`,
+> `format_in_format_args`) that predated this — all fixed as plain refactors with no behavior
+> change (verified: the `div_ceil` rewrite in particular was checked against the original
+> integer-division formula for all n before being applied, since it's Raft quorum math). If
+> clippy ever fails again, it's a genuine regression to investigate, not expected pre-existing
+> debt — this note used to say otherwise; it doesn't anymore.
+>
+> This is unrelated to the env var casing quirk documented in `CLAUDE.md` §6
+> (`REQUIRE_monitoring_FOR_SINGLE_NODE_LEADER` etc.), which is still real, still exact-cased, and
+> was deliberately left alone — it's a load-bearing external config contract, not a cosmetic
+> Rust identifier.
 
 ### Step 3: Run Unit & Integration Tests
 Execute cargo unit test suites:

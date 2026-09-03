@@ -136,7 +136,7 @@ pub fn start_corroboration_responder(table: HealthTable) {
             .unwrap_or_else(|| format!("node {requester_id}"));
 
         append_log(&format!(
-            "{},{},{},{},{},{}",
+            "{},{},{},{},{},{verdict:?}",
             now_ms(),
             request_id,
             requester_label,
@@ -152,7 +152,6 @@ pub fn start_corroboration_responder(table: HealthTable) {
                 ))
                 .collect::<Vec<_>>()
                 .join("|"),
-            format!("{verdict:?}"),
         ));
         println!(
             "[monitoring] corroboration request from {requester_label} (term {term}) -> {verdict:?} ({}ms)",
@@ -162,7 +161,7 @@ pub fn start_corroboration_responder(table: HealthTable) {
         let response = CorroborationMsg::Response { request_id, peers_checked: checks, verdict };
         if let Ok(inner) = serde_json::to_vec(&response) {
             // Sign the response so order-process nodes can verify it.
-            // A response without a valid HMAC is treated as monitoringUnreachable
+            // A response without a valid HMAC is treated as MonitoringUnreachable
             // (fail-safe: stay passive) on the receiving end.
             let frame = auth::sign(&inner);
             let _ = socket.send_to(&frame, src);

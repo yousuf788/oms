@@ -133,6 +133,10 @@ impl Wal {
         self.entries.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn last_index(&self) -> u64 {
         self.entries.last().map(|entry| entry.index).unwrap_or(0)
     }
@@ -218,14 +222,8 @@ impl Wal {
     ) -> io::Result<Vec<LogEntry>> {
         let mut entries = Vec::with_capacity(commands.len());
         let mut buf = Vec::with_capacity(commands.len() * 96);
-        let mut last_idx = self.last_index();
-        for command in commands {
-            last_idx += 1;
-            let entry = LogEntry {
-                index: last_idx,
-                term,
-                command,
-            };
+        for (index, command) in (self.last_index() + 1..).zip(commands) {
+            let entry = LogEntry { index, term, command };
             write_framed_entry(&mut buf, &entry)?;
             entries.push(entry);
         }

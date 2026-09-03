@@ -18,7 +18,7 @@ impl WatchedNodeAddr {
 }
 
 #[derive(Clone, Debug)]
-pub struct monitoringConfig {
+pub struct MonitoringConfig {
     pub bind_host: String,
     pub monitoring_port: u16,
     pub nodes: Vec<WatchedNodeAddr>,
@@ -28,7 +28,7 @@ pub struct monitoringConfig {
     pub verbose: bool,
 }
 
-static CONFIG: OnceLock<monitoringConfig> = OnceLock::new();
+static CONFIG: OnceLock<MonitoringConfig> = OnceLock::new();
 
 fn env_required(key: &str) -> String {
     env::var(key).unwrap_or_else(|_| {
@@ -59,10 +59,10 @@ fn env_bool(key: &str, default: bool) -> bool {
     }
 }
 
-fn load_from_env() -> monitoringConfig {
+fn load_from_env() -> MonitoringConfig {
     let _ = dotenvy::dotenv();
 
-    monitoringConfig {
+    MonitoringConfig {
         bind_host: env_or("BIND_HOST", "0.0.0.0"),
         monitoring_port: env_u16("monitoring_PORT", 9101),
         // Mirrors order-process/.env's NODE{1,2,3}_HOST/_HEALTH_PORT — duplicated
@@ -96,11 +96,11 @@ fn load_from_env() -> monitoringConfig {
     }
 }
 
-pub fn init_config() -> &'static monitoringConfig {
+pub fn init_config() -> &'static MonitoringConfig {
     CONFIG.get_or_init(load_from_env)
 }
 
-pub fn config() -> &'static monitoringConfig {
+pub fn config() -> &'static MonitoringConfig {
     CONFIG.get().expect("config not initialized; call init_config() first")
 }
 

@@ -62,7 +62,7 @@ pub enum CorroborationOutcome {
     NotConfigured,
     SafeToPromote,
     DeniedBymonitoring,
-    monitoringUnreachable,
+    MonitoringUnreachable,
 }
 
 struct CorroborationCache {
@@ -71,7 +71,7 @@ struct CorroborationCache {
     updated_at: Instant,
 }
 
-pub struct monitoringClient {
+pub struct MonitoringClient {
     addr: Option<SocketAddr>,
     socket: Option<UdpSocket>,
     timeout: Duration,
@@ -79,7 +79,13 @@ pub struct monitoringClient {
     cache: Mutex<CorroborationCache>,
 }
 
-impl monitoringClient {
+impl Default for MonitoringClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MonitoringClient {
     pub fn new() -> Self {
         let addr = monitoring_host().and_then(|host| {
             (host.as_str(), monitoring_port())
@@ -92,7 +98,7 @@ impl monitoringClient {
         } else {
             None
         };
-        monitoringClient {
+        MonitoringClient {
             addr,
             socket,
             timeout: Duration::from_millis(monitoring_timeout_ms()),
@@ -138,7 +144,7 @@ impl monitoringClient {
         let verdict = match outcome {
             CorroborationOutcome::SafeToPromote => CachedVerdict::SafeToPromote,
             CorroborationOutcome::DeniedBymonitoring
-            | CorroborationOutcome::monitoringUnreachable
+            | CorroborationOutcome::MonitoringUnreachable
             | CorroborationOutcome::NotConfigured => CachedVerdict::StayPassive,
         };
         let mut c = self.cache.lock().unwrap();
@@ -159,7 +165,7 @@ impl monitoringClient {
         let request = CorroborationMsg::Request { request_id, requester_id, term };
         let inner_payload = match serde_json::to_vec(&request) {
             Ok(p) => p,
-            Err(_) => return CorroborationOutcome::monitoringUnreachable,
+            Err(_) => return CorroborationOutcome::MonitoringUnreachable,
         };
         // Sign the request with monitoring_HMAC_KEY so the monitoring can reject
         // forged or replayed corroboration requests.
@@ -174,7 +180,7 @@ impl monitoringClient {
         loop {
             let now = Instant::now();
             if now >= deadline {
-                return CorroborationOutcome::monitoringUnreachable;
+                return CorroborationOutcome::MonitoringUnreachable;
             }
             if !resent && now >= resend_at {
                 let _ = socket.send_to(&payload, addr);
@@ -186,7 +192,7 @@ impl monitoringClient {
                 Ok((n, _src)) => {
                     // Verify the response HMAC before trusting the verdict.
                     // A forged SafeToPromote without a valid monitoring_HMAC_KEY
-                    // signature is indistinguishable from monitoringUnreachable
+                    // signature is indistinguishable from MonitoringUnreachable
                     // (the fail-safe default: stay passive).
                     let inner = match auth::verify_monitoring(&buf[..n]) {
                         Some(p) => p,
