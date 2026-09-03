@@ -108,6 +108,64 @@ the original zero-loss requirement asks for — it does not by itself prove exac
 (the system provides at-least-once with idempotent dedup, not exactly-once — see `docs/HLD.md`
 §7) and does not by itself prove the 300k/sec target.
 
+### 0.5 Phase B changes (propose/commit pipelining, allocation removal, WAL replication-clone fix) — 2026-09-03
+
+Context: a 500K-2M orders/sec design-target audit (separate from the 200k-300k target in §0.3)
+identified the dominant end-to-end bottleneck as `order-process`'s `propose_batch` blocking the
+main ingest loop for up to 1500ms per batch, waiting for Raft quorum commit before the loop could
+gather the next batch — so batch N+1 could never even start building until batch N committed. Full
+technical proposal and code are in `order-process/src/leader_election.rs` (see `propose_batch`,
+`commit_driver_loop` doc comments) and `order-process/src/main.rs`/`order-process/src/wal.rs`
+(per-order allocation removal: `processed_by` changed from `String` to `Arc<str>`, one allocation
+per batch instead of one per order).
+
+**A real regression was found and fixed during this work, not just the intended optimization**:
+removing the wait exposed a pre-existing latent bug in `Wal::entries_from` (used by
+`replicate_to_peers`) — it cloned the *entire* remaining WAL tail for any peer whose `next_index`
+wasn't advancing (e.g. an offline peer, or the other two configured-but-not-running nodes in a
+1-node test), even though the caller immediately discards everything past a 1400-byte budget. This
+was already present before today's changes but rarely mattered because `propose_batch`'s old wait
+loop throttled how often `replicate_to_peers` ran; removing that throttle made it run far more
+often, turning an O(n) clone into an effective O(n²) cost as the WAL grew — this **caused a severe
+throughput regression** (a 1-node run at the previous baseline's own `TARGET_TPS=25000` dropped to
+~2,300 orders/sec received, p95 latency over 20s, before the fix). Fixed with
+`Wal::entries_from_capped`, which bounds the clone to `MAX_REPLICATE_LOOKAHEAD_ENTRIES` (512)
+regardless of how far behind a peer is. All numbers below are measured *after* this fix.
+
+Methodology unchanged from §0.2 (`scripts/run_benchmark.sh`, converge-then-score, same shared
+12-core desktop, same caveats about not being the real lab hardware — see §0.3, which still
+applies unchanged; none of this validates 500K-2M/sec, only measures the effect of these specific
+code changes):
+
+| Configuration | Previous (§0.2) | Now (steady-state, low p50 latency) | Change |
+|---|---|---|---|
+| 1 node (no Raft) | ~24,600/sec | **~100,000-150,000/sec** (100K: 1,953,792 sent, 0 missing/dup, p50=25ms; 150K: 2,183,168 sent, 0 missing/dup, but p50=2,684ms — steady-state ceiling is below this) | ~4-6x |
+| 3 nodes (full Raft) | ~5,800-6,000/sec | **~8,000/sec** (155,648 sent, 0 missing/dup, p50=3ms, p95=4,288ms — tail latency from end-of-run drain) | ~30-35% |
+
+This is the first time this harness reports **p50/p95/p99/p99.9/max end-to-end latency**
+(send timestamp from `order-sending`'s WAL joined against `order-receiver`'s log by `order_id`,
+implemented directly in `scripts/run_benchmark.sh` — no wire-format change), not just aggregate
+TPS — see the `LATENCY_REPORT` block in that script. At 1-node/100K TPS: p50=25ms, p95=1,629ms,
+p99=1,740ms — the p95/p99 tail reflects orders still draining after the sender stops, not
+steady-state processing latency.
+
+**Honest gaps, not resolved by this work**:
+- 3-node's improvement (~30-35%) is far smaller than 1-node's (~4-6x). The propose/commit
+  pipelining fix removed the *local* serialization (waiting on your own quorum-check loop); it did
+  not change how fast `AppendEntries` actually reaches and gets acknowledged by 2 real peer
+  processes over UDP on a shared machine. That remaining cost is not yet root-caused — a
+  reasonable next step, not done here, given this session's approved scope was the pipelining fix,
+  allocation removal, Aeron tuning knobs, and latency instrumentation, not a further consensus
+  redesign.
+- Neither 1-node's ~100-150K/sec nor 3-node's ~8K/sec is within an order of magnitude of the 500K
+  minimum target, let alone 1M-2M. §0.3's caveats about this being a shared, non-dedicated,
+  non-lab machine apply in full — these numbers should not be read as this design's ceiling, only
+  as this machine's ceiling today, same as every other number in this document.
+- Aeron transport tuning (`AERON_TERM_LENGTH`/`AERON_MTU`/`AERON_SO_SNDBUF`/`AERON_SO_RCVBUF`, see
+  each crate's `config.rs::aeron_channel_tuning()`) was added as an opt-in capability but left at
+  Media Driver defaults for these runs — no target lab hardware/network was specified to tune
+  against, so no claim is made about its effect.
+
 ---
 
 ## Executive Summary

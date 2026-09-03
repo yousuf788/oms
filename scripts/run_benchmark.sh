@@ -280,6 +280,68 @@ if [ -f "$RECEIVED_LOG" ]; then
     ')
 fi
 
+# LATENCY: join order-sending's binary WAL (order_id -> ts_ms at send time)
+# against order-receiver's log (order_id is field 1, received_ts_ms is
+# always the LAST field regardless of how many space-separated tokens
+# precede it — processed_by, e.g. "Nitin (S2-1)", itself contains a space,
+# so this uses $1/last-field extraction rather than a fixed field index).
+# End-to-end latency per order = received_ts_ms - sent_ts_ms. This is the
+# first latency instrumentation in this harness — previously it only
+# reported aggregate TPS/loss from log line counts, with no p50/p99/p99.9
+# breakdown at all.
+LATENCY_REPORT=""
+if [ -f "$SENT_WAL" ] && [ -f "$RECEIVED_LOG" ]; then
+    LATENCY_REPORT=$(python3 - "$SENT_WAL" "$RECEIVED_LOG" <<'PYEOF'
+import struct, sys
+
+sent_wal_path, received_log_path = sys.argv[1], sys.argv[2]
+
+# OrderWire (order-sending/src/main.rs): order_id: u64, symbol: u8,
+# side: bool, qty: u32, ts_ms: u64 — bincode's default fixed-width
+# little-endian encoding, 22 bytes total, no padding.
+sent_ts_by_id = {}
+data = open(sent_wal_path, "rb").read()
+pos = 0
+while pos + 4 <= len(data):
+    (length,) = struct.unpack_from("<I", data, pos)
+    pos += 4
+    if pos + length > len(data):
+        break
+    if length == 22:
+        order_id = struct.unpack_from("<Q", data, pos)[0]
+        ts_ms = struct.unpack_from("<Q", data, pos + 14)[0]
+        sent_ts_by_id[order_id] = ts_ms
+    pos += length
+
+latencies = []
+with open(received_log_path, "r") as f:
+    for line in f:
+        parts = line.split()
+        if len(parts) < 2:
+            continue
+        try:
+            order_id = int(parts[0])
+            received_ts_ms = int(parts[-1])
+        except ValueError:
+            continue
+        sent_ts_ms = sent_ts_by_id.get(order_id)
+        if sent_ts_ms is not None and received_ts_ms >= sent_ts_ms:
+            latencies.append(received_ts_ms - sent_ts_ms)
+
+if not latencies:
+    print("no matched order_ids between sent WAL and received log — skipped")
+else:
+    latencies.sort()
+    n = len(latencies)
+    def pct(p):
+        idx = min(n - 1, int(n * p / 100))
+        return latencies[idx]
+    print(f"n={n} matched  p50={pct(50)}ms  p95={pct(95)}ms  p99={pct(99)}ms  "
+          f"p99.9={pct(99.9)}ms  max={latencies[-1]}ms  min={latencies[0]}ms")
+PYEOF
+)
+fi
+
 LOSS_COUNT=$((SENT_COUNT - RECEIVED_COUNT))
 if [ "$SENT_COUNT" -gt 0 ]; then
     LOSS_PERCENT=$(awk "BEGIN {printf \"%.4f\", ($LOSS_COUNT / $SENT_COUNT) * 100}")
@@ -296,6 +358,9 @@ echo " Total Orders Sent      : $SENT_COUNT  (~${SENT_TPS} orders/sec)"
 echo " Total Results Received : $RECEIVED_COUNT  (~${RECEIVED_TPS} orders/sec)"
 echo " Sent - Received        : $LOSS_COUNT  (${LOSS_PERCENT}%) — at end of drain window; see note below"
 echo " Duplicate order_ids in received log : $DUPLICATE_COUNT"
+if [ -n "$LATENCY_REPORT" ]; then
+    echo " End-to-end latency (send -> receive): $LATENCY_REPORT"
+fi
 if [ -n "$MISSING_RANGES" ]; then
     echo " Missing order_id ranges (still outstanding at scoring time):"
     echo "$MISSING_RANGES" | sed 's/^/   /'

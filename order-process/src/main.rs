@@ -132,8 +132,8 @@ fn main() {
     // Each S2 node subscribes on its own host:order_port.
     // S1 (order-sending) publishes to each of these unicast endpoints.
     let order_channel = format!(
-        "aeron:udp?endpoint={}:{}",
-        self_node.host, self_node.order_port
+        "aeron:udp?endpoint={}:{}{}",
+        self_node.host, self_node.order_port, order_process::config::aeron_channel_tuning()
     );
     println!(
         "[order-process] subscribing to orders on {order_channel} stream {ORDER_STREAM_ID}"
@@ -152,7 +152,10 @@ fn main() {
     println!("[order-process] order channel subscription ACTIVE on stream {ORDER_STREAM_ID}");
 
     // All 3 nodes create this publication. Only the active leader calls offer().
-    let result_channel = format!("aeron:udp?endpoint={}:{}", cfg.s3_host, cfg.s3_port);
+    let result_channel = format!(
+        "aeron:udp?endpoint={}:{}{}",
+        cfg.s3_host, cfg.s3_port, order_process::config::aeron_channel_tuning()
+    );
     println!(
         "[order-process] adding result publication → {result_channel} stream {RESULT_STREAM_ID}"
     );
@@ -290,6 +293,11 @@ fn process_orders_batch_as_leader(
     let current_term = election.current_term();
     let outcomes = ["FILLED", "PARTIALLY_FILLED", "REJECTED"];
     let mut rng = rand::thread_rng();
+    // Identical for every order in this batch — hoisted out of the per-order
+    // map and shared via Arc so a 20,000-order batch does 1 heap allocation
+    // here instead of 20,000 (Arc::clone below is a refcount bump, not an
+    // allocation; see the field's doc comment in wal.rs for wire-compat notes).
+    let processed_by: Arc<str> = Arc::from(format!("{} (S2-{})", leader, node_id));
 
     let commands: Vec<ReplicatedCommand> = orders
         .iter()
@@ -307,7 +315,7 @@ fn process_orders_batch_as_leader(
                 qty: order.qty,
                 status: status.to_string(),
                 filled_qty,
-                processed_by: format!("{} (S2-{})", leader, node_id),
+                processed_by: Arc::clone(&processed_by),
                 term: current_term,
             }
         })

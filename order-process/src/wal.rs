@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ReplicatedCommand {
@@ -11,7 +12,11 @@ pub struct ReplicatedCommand {
     pub qty: u32,
     pub status: String,
     pub filled_qty: u32,
-    pub processed_by: String,
+    // Arc<str>, not String: identical to it on the wire (bincode/serde encode
+    // both as length + UTF-8 bytes via serialize_str), but every order in a
+    // batch shares the same processed_by value — Arc::clone is a refcount
+    // bump instead of a fresh heap allocation per order (see main.rs).
+    pub processed_by: Arc<str>,
     pub term: u64,
 }
 
@@ -181,6 +186,35 @@ impl Wal {
         self.entries[start..].to_vec()
     }
 
+    /// Same as `entries_from`, but clones at most `max_entries` starting at
+    /// `from_index` instead of everything through the end of the log.
+    ///
+    /// `replicate_to_peers` is the only caller, and it immediately discards
+    /// everything past `APPEND_BATCH_BYTE_BUDGET` anyway via
+    /// `entries_within_budget` — but `entries_from` unconditionally cloned
+    /// the *entire* remaining tail first. For a peer whose `next_index`
+    /// never advances (offline, or simply this being a single-node
+    /// deployment where the other two configured peers never run), that
+    /// clone's size grows without bound as the WAL grows, since every
+    /// batch's `replicate_to_peers()` call re-clones from the same stuck
+    /// `next_index` through an ever-growing `last_index`. That's an O(log
+    /// size) cost paid on every single batch, not just this occasional
+    /// control-path replay lookups the rest of this file's comments
+    /// document as accepting O(n) for — a real regression once
+    /// `propose_batch` stopped throttling how often replication fires (see
+    /// its doc comment in leader_election.rs).
+    pub fn entries_from_capped(&self, from_index: u64, max_entries: usize) -> Vec<LogEntry> {
+        if from_index == 0 {
+            return self.entries.iter().take(max_entries).cloned().collect();
+        }
+        let start = match self.entries.binary_search_by_key(&from_index, |e| e.index) {
+            Ok(idx) => idx,
+            Err(idx) => idx,
+        };
+        let end = (start + max_entries).min(self.entries.len());
+        self.entries[start..end].to_vec()
+    }
+
     /// Committed entries whose `command.order_id` falls in `[from, to]`
     /// (inclusive; `to = u64::MAX` means "everything from `from` onward").
     /// Serves REPLAY_REQUEST for the S2->S3 hop, where the caller only
@@ -292,7 +326,7 @@ mod tests {
                 qty: 5,
                 status: "FILLED".to_string(),
                 filled_qty: 5,
-                processed_by: "Nitin (S2-1)".to_string(),
+                processed_by: "Nitin (S2-1)".into(),
                 term: 1,
             },
         }

@@ -81,6 +81,33 @@ fn env_bool(key: &str, default: bool) -> bool {
     }
 }
 
+/// Optional Aeron channel-URI tuning params (`term-length`, `mtu`,
+/// `so-sndbuf`, `so-rcvbuf`), appended to every publication/subscription URI
+/// this crate builds. All four are unset by default, which preserves
+/// today's behavior (Media Driver defaults) — every publication/subscription
+/// in this codebase previously used a bare `aeron:udp?endpoint=...` URI with
+/// no transport tuning at all. Set the env vars to opt in; `so-sndbuf`/
+/// `so-rcvbuf` must not exceed this host's OS socket buffer limits
+/// (`net.core.rmem_max`/`wmem_max` on Linux) or Aeron will fail to create
+/// the publication/subscription — raise those sysctls first if increasing
+/// these. `term-length` must be a power of two, minimum 64KB.
+pub fn aeron_channel_tuning() -> String {
+    let mut params = String::new();
+    if let Ok(v) = env::var("AERON_TERM_LENGTH") {
+        params.push_str(&format!("|term-length={v}"));
+    }
+    if let Ok(v) = env::var("AERON_MTU") {
+        params.push_str(&format!("|mtu={v}"));
+    }
+    if let Ok(v) = env::var("AERON_SO_SNDBUF") {
+        params.push_str(&format!("|so-sndbuf={v}"));
+    }
+    if let Ok(v) = env::var("AERON_SO_RCVBUF") {
+        params.push_str(&format!("|so-rcvbuf={v}"));
+    }
+    params
+}
+
 fn load_from_env() -> ClusterConfig {
     let _ = dotenvy::dotenv();
 

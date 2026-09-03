@@ -22,6 +22,13 @@ use std::time::{Duration, Instant};
 /// replication never silently depends on IP fragmentation (a single lost
 /// fragment loses the whole datagram).
 const APPEND_BATCH_BYTE_BUDGET: usize = 1400;
+/// Upper bound on how many entries `replicate_to_peers` clones out of the
+/// WAL per peer per call before trimming to `APPEND_BATCH_BYTE_BUDGET` — see
+/// `Wal::entries_from_capped`'s doc comment for why this must not be
+/// unbounded (a peer stuck far behind, or simply offline, must not make this
+/// clone grow with total WAL size). Generous relative to what actually fits
+/// in the byte budget for any realistic `ReplicatedCommand` size.
+const MAX_REPLICATE_LOOKAHEAD_ENTRIES: usize = 512;
 const RECV_BUF_SIZE: usize = 2_000_000;
 
 /// Takes as many `entries` (in order) as fit within `budget_bytes` once
@@ -262,6 +269,9 @@ impl LeaderElection {
         let tick_handle = Arc::clone(&election);
         thread::spawn(move || tick_handle.tick_loop());
 
+        let commit_driver_handle = Arc::clone(&election);
+        thread::spawn(move || commit_driver_handle.commit_driver_loop());
+
         let monitoring_handle = Arc::clone(&election);
         thread::spawn(move || monitoring_handle.monitoring_loop());
 
@@ -471,6 +481,40 @@ impl LeaderElection {
         None
     }
 
+    /// Appends `commands` to this leader's WAL and kicks off replication,
+    /// then returns immediately — it does NOT wait for quorum commit.
+    ///
+    /// It used to busy-poll for up to 1500ms until the batch was
+    /// majority-committed before returning, which serialized the caller's
+    /// ingest loop behind a UDP round-trip to a quorum of peers on every
+    /// single batch (the dominant end-to-end throughput ceiling: batch N+1
+    /// couldn't even start building until batch N committed). That wait was
+    /// never a correctness requirement — result_publisher_loop already
+    /// streams each entry to S3 independently as soon as it commits,
+    /// regardless of which propose_batch() call proposed it (see that
+    /// function's doc comment), and apply_committed_entries() only ever
+    /// advances past majority-replicated entries. So the wait was pure
+    /// (accidental) backpressure, not a safety gate.
+    ///
+    /// Commit detection for whatever this call just appended continues via
+    /// the dedicated commit_driver_loop thread (started in `new()`), which
+    /// drives replicate_to_peers()/try_advance_commit() at ~1ms granularity
+    /// whenever entries are outstanding — preserving the previous commit
+    /// latency without blocking this call's caller. The bounded ingest
+    /// channel between Aeron polling and batch-building (see main.rs,
+    /// crossbeam_channel::bounded(500_000)) remains the flow-control bound:
+    /// if followers fall far enough behind that WAL entries accumulate
+    /// uncommitted, that channel fills and Aeron's own backpressure
+    /// throttles order-sending, same as before this change.
+    ///
+    /// If this leader steps down before an appended batch commits, that
+    /// uncommitted WAL tail is simply overwritten/ignored by the next
+    /// leader via the normal AppendEntries consistency check — standard
+    /// Raft behavior, unaffected by this change.
+    ///
+    /// The returned `Vec` is the locally-appended commands (not necessarily
+    /// committed yet) — kept for API compatibility, but no caller currently
+    /// uses this return value for anything (see main.rs).
     pub fn propose_batch(&self, commands: Vec<ReplicatedCommand>) -> Vec<ReplicatedCommand> {
         if commands.is_empty() {
             return Vec::new();
@@ -499,32 +543,40 @@ impl LeaderElection {
             st.match_index.insert(self.self_id, max_index);
         }
 
+        // One immediate attempt — enough on its own for a single-node (all
+        // peers down) leader, since quorum is 1. commit_driver_loop takes
+        // over from here for anything not yet committed.
         self.replicate_to_peers();
         self.try_advance_commit();
 
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_millis(1500) {
-            // Always drive commit + apply so single-node (all peers down) works.
-            self.try_advance_commit();
-            self.apply_committed_entries();
-            {
-                let st = self.state.lock().unwrap();
-                if st.role != Role::Leader {
-                    return Vec::new();
-                }
-                if st.last_applied >= max_index {
-                    let wal = self.wal.lock().unwrap();
-                    return entries
-                        .iter()
-                        .filter_map(|e| wal.entry_at(e.index).map(|c| c.command))
-                        .collect();
-                }
+        entries.into_iter().map(|e| e.command).collect()
+    }
+
+    /// Drives commit detection at a much tighter interval than tick_loop's
+    /// 50ms heartbeat cadence, so per-batch commit latency stays close to
+    /// what propose_batch() used to achieve by polling inline — without
+    /// blocking propose_batch()'s caller (see that function's doc comment).
+    /// Idles at a coarser interval whenever nothing is outstanding, so an
+    /// idle leader doesn't busy-poll for no reason.
+    fn commit_driver_loop(&self) {
+        loop {
+            let is_leader = self.state.lock().unwrap().role == Role::Leader;
+            if !is_leader {
+                thread::sleep(Duration::from_millis(20));
+                continue;
             }
-            // Replicate to any peers that may have rejoined.
-            self.replicate_to_peers();
-            thread::sleep(Duration::from_millis(1));
+
+            let last_applied = self.state.lock().unwrap().last_applied;
+            let last_index = self.wal.lock().unwrap().last_index();
+
+            if last_applied < last_index {
+                self.replicate_to_peers();
+                self.try_advance_commit();
+                thread::sleep(Duration::from_millis(1));
+            } else {
+                thread::sleep(Duration::from_millis(20));
+            }
         }
-        Vec::new()
     }
 
     fn send(&self, peer: &S2Node, msg: &Message) {
@@ -774,7 +826,10 @@ impl LeaderElection {
             let prev_log_index = next_idx.saturating_sub(1);
             let prev_log_term = wal.get_term_at(prev_log_index).unwrap_or(0);
             let entries = if next_idx <= leader_last {
-                entries_within_budget(wal.entries_from(next_idx), APPEND_BATCH_BYTE_BUDGET)
+                entries_within_budget(
+                    wal.entries_from_capped(next_idx, MAX_REPLICATE_LOOKAHEAD_ENTRIES),
+                    APPEND_BATCH_BYTE_BUDGET,
+                )
             } else {
                 Vec::new()
             };
@@ -1300,7 +1355,7 @@ mod tests {
                 qty: 1,
                 status: "FILLED".to_string(),
                 filled_qty: 1,
-                processed_by: "Nitin (S2-1)".to_string(),
+                processed_by: "Nitin (S2-1)".into(),
                 term: 1,
             },
         }

@@ -55,3 +55,26 @@ fn load_from_env() -> SenderConfig {
 pub fn init_config() -> &'static SenderConfig {
     CONFIG.get_or_init(load_from_env)
 }
+
+/// Optional Aeron channel-URI tuning params (`term-length`, `mtu`,
+/// `so-sndbuf`, `so-rcvbuf`), appended to every publication URI this crate
+/// builds. All four are unset by default, preserving today's behavior
+/// (Media Driver defaults) — see order-process/src/config.rs's copy of this
+/// function for the full rationale and the OS sysctl caveat for the
+/// socket-buffer params.
+pub fn aeron_channel_tuning() -> String {
+    let mut params = String::new();
+    if let Ok(v) = env::var("AERON_TERM_LENGTH") {
+        params.push_str(&format!("|term-length={v}"));
+    }
+    if let Ok(v) = env::var("AERON_MTU") {
+        params.push_str(&format!("|mtu={v}"));
+    }
+    if let Ok(v) = env::var("AERON_SO_SNDBUF") {
+        params.push_str(&format!("|so-sndbuf={v}"));
+    }
+    if let Ok(v) = env::var("AERON_SO_RCVBUF") {
+        params.push_str(&format!("|so-rcvbuf={v}"));
+    }
+    params
+}

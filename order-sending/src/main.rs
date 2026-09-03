@@ -172,7 +172,10 @@ fn main() {
     // publisher thread below. ──────────────────────────────────────────────
     let mut node_channels: Vec<mpsc::SyncSender<Arc<Vec<u8>>>> = Vec::new();
     for (i, node) in cfg.nodes.iter().enumerate() {
-        let ch = format!("aeron:udp?endpoint={}:{}", node.host, node.order_port);
+        let ch = format!(
+            "aeron:udp?endpoint={}:{}{}",
+            node.host, node.order_port, config::aeron_channel_tuning()
+        );
         println!("[order-sending] publication[{i}] → {ch} stream {ORDER_STREAM_ID}");
         let ch_cstr = CString::new(ch).unwrap();
         let pub_ = aeron

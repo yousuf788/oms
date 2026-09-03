@@ -89,7 +89,10 @@ fn main() {
     println!("[order-receiver] Aeron client successfully connected to media driver");
 
     println!("[order-receiver] === STEP 3: Subscribing to Aeron Result Channel ===");
-    let channel = format!("aeron:udp?endpoint={}:{}", cfg.bind_host, cfg.bind_port);
+    let channel = format!(
+        "aeron:udp?endpoint={}:{}{}",
+        cfg.bind_host, cfg.bind_port, config::aeron_channel_tuning()
+    );
     println!(
         "[order-receiver] subscribing on {channel} stream {RESULT_STREAM_ID}, writing to {}",
         received_log_path().display()
