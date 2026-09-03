@@ -145,6 +145,16 @@ impl Wal {
         self.entries.last().map(|entry| entry.term).unwrap_or(0)
     }
 
+    /// Highest `order_id` among all entries currently in this WAL — NOT the
+    /// same as `last_index()` (that's the Raft log position; this is the
+    /// business identity). Used to seed the ingest-side `SequenceTracker`'s
+    /// watermark and fire a startup catch-up `REPLAY_REQUEST` to
+    /// order-sending on restart, so this node proactively recovers whatever
+    /// it missed instead of waiting for a new live order to reveal the gap.
+    pub fn max_order_id(&self) -> u64 {
+        self.entries.iter().map(|e| e.command.order_id).max().unwrap_or(0)
+    }
+
     pub fn get_term_at(&self, index: u64) -> Option<u64> {
         if index == 0 {
             return Some(0);

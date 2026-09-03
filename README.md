@@ -341,3 +341,7 @@ This makes the delivery model **at-least-once with idempotent per-hop processing
   node it watches — if it shares a machine or network path with one of them, a
   failure there can take out both the node and the monitoring's ability to corroborate
   at once, defeating the point. See `order-monitoring/.env` for current placement.
+- `order-monitoring` also shows the current believed leader — piggybacked on its
+  existing health probe, logged to `logs/leader-transitions.log` on change and printed
+  as a rate-limited "all N nodes reachable, leader=X" status line while healthy. Purely
+  observational (see `docs/HLD.md` §6.2) — it never affects any corroboration decision.

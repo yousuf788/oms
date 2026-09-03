@@ -11,7 +11,7 @@ use rusteron_client::{AeronPublication, BusySpinIdleStrategy, IdleStrategy};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -71,6 +71,21 @@ pub enum Role {
     Follower,
     Candidate,
     Leader,
+}
+
+impl Role {
+    /// Wire encoding for the health-probe Pong's `role` byte (see
+    /// health_probe.rs and order-monitoring's health_poll.rs, which decodes
+    /// this same 0/1/2 convention independently — no shared crate exists to
+    /// share an enum type across, so the mapping is duplicated by
+    /// convention, documented in both places).
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Role::Follower => 0,
+            Role::Candidate => 1,
+            Role::Leader => 2,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -147,6 +162,15 @@ pub struct LeaderElection {
     /// `peers_unreachable()`. A local isolation timeout is never sufficient on
     /// its own to justify self-promotion; this is what corroborates it.
     monitoring: MonitoringClient,
+    /// Lock-free, display-only role/term snapshot, refreshed once per Raft
+    /// tick (see `tick_loop()`). Shared with `health_probe.rs`'s responder
+    /// thread (created and passed in from main.rs before this struct
+    /// exists, since the health responder starts before Raft does) so it
+    /// can report this node's current role in its Pong reply — purely for
+    /// order-monitoring to display "who is leader"; never read back into
+    /// any consensus decision here.
+    role_atomic: Arc<AtomicU8>,
+    term_atomic: Arc<AtomicU64>,
 }
 
 impl LeaderElection {
@@ -157,6 +181,8 @@ impl LeaderElection {
         self_id: u8,
         result_pub: AeronPublication,
         replay_rx: Receiver<(u64, u64)>,
+        role_atomic: Arc<AtomicU8>,
+        term_atomic: Arc<AtomicU64>,
     ) -> Arc<Self> {
         let self_node = find_node(self_id).expect("unknown node id");
         let peers: Vec<S2Node> = s2_nodes()
@@ -214,6 +240,8 @@ impl LeaderElection {
             allowed_ips,
             started_at: Instant::now(),
             monitoring: MonitoringClient::new(),
+            role_atomic,
+            term_atomic,
         });
 
         println!(
@@ -355,6 +383,15 @@ impl LeaderElection {
 
     pub fn current_term(&self) -> u64 {
         self.state.lock().unwrap().term
+    }
+
+    /// Highest `order_id` this node has already committed to its own WAL —
+    /// used at startup to seed the ingest `SequenceTracker`'s watermark and
+    /// fire a catch-up `REPLAY_REQUEST` to order-sending (see main.rs and
+    /// replay_client.rs), regardless of Raft role (a follower's WAL is just
+    /// as valid a source of "what have I already got" as a leader's).
+    pub fn max_committed_order_id(&self) -> u64 {
+        self.wal.lock().unwrap().max_order_id()
     }
 
     /// Role line including "not available" for silent peers.
@@ -851,6 +888,14 @@ impl LeaderElection {
 
             let action = {
                 let mut st = self.state.lock().unwrap();
+                // Refreshed every tick (50ms) rather than at every individual
+                // role/term mutation site — one touch point instead of
+                // several scattered ones, and 50ms is far more precise than
+                // this needs to be (health probes poll every 500ms by
+                // default). Read lock-free by health_probe.rs's responder;
+                // display-only, never used for any consensus decision.
+                self.role_atomic.store(st.role.as_u8(), Ordering::Relaxed);
+                self.term_atomic.store(st.term, Ordering::Relaxed);
                 match st.role {
                     Role::Leader => Action::Replicate,
                     Role::Candidate => {

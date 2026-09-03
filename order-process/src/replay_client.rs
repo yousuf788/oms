@@ -35,11 +35,19 @@ const DEBOUNCE: Duration = Duration::from_millis(50);
 const INITIAL_BACKOFF: Duration = Duration::from_millis(100);
 const MAX_BACKOFF: Duration = Duration::from_secs(5);
 
+/// `startup_watermark` is the highest `order_id` this node has already
+/// committed to its own WAL (0 if none) — this unconditionally requests
+/// everything after it once, up front, so a restart catches up immediately
+/// instead of waiting for a new live order to happen to reveal the gap via
+/// `missing_ranges()`. order-sending keeps sending regardless of whether any
+/// particular node is caught up, so this is what makes catch-up automatic
+/// rather than depending on when the next live order lands.
 pub fn start_replay_client(
     self_id: u8,
     s1_host: String,
     s1_replay_port: u16,
     tracker: Arc<Mutex<SequenceTracker>>,
+    startup_watermark: u64,
 ) {
     thread::spawn(move || {
         let socket = match UdpSocket::bind(("0.0.0.0", 0)) {
@@ -49,6 +57,14 @@ pub fn start_replay_client(
                 return;
             }
         };
+
+        send_request(&socket, &s1_host, s1_replay_port, self_id, &[(startup_watermark + 1, u64::MAX)]);
+        if crate::config::verbose_raft() {
+            println!(
+                "[S2-{self_id}] startup catch-up: requested replay from order_id {} onward",
+                startup_watermark + 1
+            );
+        }
 
         let mut first_seen: HashMap<(u64, u64), Instant> = HashMap::new();
         let mut next_retry: HashMap<(u64, u64), Instant> = HashMap::new();

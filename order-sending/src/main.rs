@@ -194,7 +194,17 @@ fn main() {
             // so a node that never connects (or drops mid-stream) just loses
             // this one message instead of wedging the whole pipeline.
             const MAX_BACKPRESSURE_RETRIES: u32 = 100_000;
+            // Skipping an unreachable node is expected, ongoing, and not
+            // data loss (the order stays in this process's WAL and is
+            // recovered via REPLAY_REQUEST once the node reconnects — see
+            // replay.rs) — but at target throughput a fully unreachable node
+            // would otherwise print one line per dropped order, which is
+            // exactly the per-order hot-path logging this codebase's own
+            // conventions rule out. Log a periodic summary instead.
+            const LOG_INTERVAL: Duration = Duration::from_secs(5);
             let mut idle = BusySpinIdleStrategy;
+            let mut last_logged = Instant::now() - LOG_INTERVAL; // log the first drop immediately
+            let mut dropped_since_log: u64 = 0;
             while let Ok(frame) = node_rx.recv() {
                 let mut retries = 0u32;
                 loop {
@@ -206,7 +216,17 @@ fn main() {
                             continue;
                         }
                         Err(e) => {
-                            eprintln!("[order-sending] publish error (node {}): {e}", i + 1);
+                            dropped_since_log += 1;
+                            let now = Instant::now();
+                            if now.duration_since(last_logged) >= LOG_INTERVAL {
+                                eprintln!(
+                                    "[order-sending] node {}: {dropped_since_log} order(s) skipped for live delivery in the last {:.0}s (durable in WAL, recoverable via replay once it reconnects) — last error: {e}",
+                                    i + 1,
+                                    now.duration_since(last_logged).as_secs_f64(),
+                                );
+                                last_logged = now;
+                                dropped_since_log = 0;
+                            }
                             break;
                         }
                     }

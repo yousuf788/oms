@@ -322,6 +322,33 @@ order-process node (locally isolated, PEER_SILENT_MS elapsed)
 - **Audit trail**: every corroboration request/response and every reachability state
   change is logged to flat files under `order-monitoring/logs/` (see §11).
 
+### 6.2 Leader Visibility (Display-Only)
+
+`order-monitoring` also shows which node it currently believes is leader — piggybacked
+on the same health-probe `Ping`/`Pong` round-trip it already does every
+`monitoring_POLL_INTERVAL_MS` (500ms default), not a new channel. Each `order-process`
+node keeps two lock-free atomics (`role`, `term`) refreshed once per Raft tick (50ms) by
+`LeaderElection`, and its health responder (`health_probe.rs`) reads them — never
+`RaftState` itself, never a lock — when building each `Pong` reply. This preserves the
+existing invariant that a health probe can never perturb or depend on consensus state.
+
+`order-monitoring` logs a line to `logs/leader-transitions.log` (and console) only when
+the believed leader changes — mirroring the existing `health-transitions.log` pattern —
+and, separately, prints a rate-limited status line (at most once per 15s) confirming "all
+N nodes reachable, leader=X" while every watched node stays reachable, so an operator
+watching the console gets both event-driven changes and a periodic live confirmation.
+
+**This is strictly observational.** Nothing here feeds back into any corroboration
+decision or promotion logic — `order-monitoring` remains the same non-sequencing arbiter
+described above; it just now also displays what it passively observes about leadership,
+the same way it already displays reachability.
+
+If more than one node reports `LEADER` in the same poll round (should only ever be a
+transient artifact of the ~50ms tick lag during a handoff, never a steady state — a real
+persistent occurrence would indicate an actual split-brain and is worth investigating
+immediately), monitoring logs a `WARNING` line naming every node involved and its term;
+the higher-term report is treated as current for display purposes.
+
 ---
 
 ## 7. Sequence Identity, Gap Detection & Replay Protocol
@@ -408,7 +435,9 @@ S3 → S2 (a gap in incoming results):
                      re-published on the live result channel
 ```
 
-Repeated requests for a still-outstanding range back off exponentially (100ms → 5s cap) — this never becomes a tight retry loop, and it converges eventually rather than giving up. `order-receiver` also fires one unconditional catch-up request for `checkpoint+1..∞` at startup, so a restart during an otherwise-idle pipeline still recovers (nothing else would reveal the gap to it).
+Repeated requests for a still-outstanding range back off exponentially (100ms → 5s cap) — this never becomes a tight retry loop, and it converges eventually rather than giving up.
+
+Both `order-process` and `order-receiver` also fire one unconditional catch-up request at startup — `last_committed_order_id+1..∞` (read from `order-process`'s own WAL) and `checkpoint+1..∞` respectively — instead of only detecting a gap reactively once a new live order happens to arrive. This matters because order-sending never stops sending on its own: without a proactive startup request, a freshly (re)started node would only notice how far behind it is the moment the *next* live order lands, which works but is passive; the proactive version means a restarted node starts recovering immediately, verified end-to-end (a node started fresh against an 8k-order backlog with nothing listening caught up to zero gaps and zero duplicates within seconds, with order-sending never pausing).
 
 ### 7.6 Backpressure design — two related fixes found by load testing
 
@@ -529,3 +558,4 @@ Both were found and fixed during the load-testing effort documented in `docs/BEN
 | `order-receiver/logs/receiver-checkpoint.dat` | Server 1 | Dedup/gap watermark (§7.3) — not order content | text (`u64`) |
 | `order-monitoring/logs/health-transitions.log` | monitoring machine | Reachability state changes for each watched node | text |
 | `order-monitoring/logs/corroboration.log` | monitoring machine | Every corroboration request + verdict (audit trail) | text |
+| `order-monitoring/logs/leader-transitions.log` | monitoring machine | Believed-leader changes only (§6.2) — display-only, not used for any decision | text |

@@ -11,7 +11,7 @@
 use order_process::config::{find_node, init_config, node_name, resolve_node_id};
 use order_process::auth;
 use order_process::health_probe::start_health_responder;
-use order_process::leader_election::LeaderElection;
+use order_process::leader_election::{LeaderElection, Role};
 use order_process::replay_client::start_replay_client;
 use order_process::replay_server::start_replay_server;
 use order_process::sequence_tracker::SequenceTracker;
@@ -20,6 +20,7 @@ use rand::Rng;
 use rusteron_client::*;
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
+use std::sync::atomic::{AtomicU64, AtomicU8};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -83,7 +84,19 @@ fn main() {
     println!("[order-process] === STEP 2: Starting monitoring Health Probe Responder ===");
     // Trivial liveness responder for the monitoring service — independent of Aeron
     // and the Raft control channel, so it comes up even before either does.
-    start_health_responder(node_id, &cfg.bind_host, self_node.health_port);
+    // Created here (before Raft/LeaderElection exists) and handed to it once
+    // it starts — see LeaderElection::start's role_atomic/term_atomic params
+    // — so the health responder can report this node's current role/term
+    // in its Pong reply without waiting for or depending on Raft startup.
+    let role_atomic = Arc::new(AtomicU8::new(Role::Follower.as_u8()));
+    let term_atomic = Arc::new(AtomicU64::new(0));
+    start_health_responder(
+        node_id,
+        &cfg.bind_host,
+        self_node.health_port,
+        Arc::clone(&role_atomic),
+        Arc::clone(&term_atomic),
+    );
     println!(
         "[health-probe] UDP liveness responder listening on {}:{}",
         cfg.bind_host, self_node.health_port
@@ -155,7 +168,7 @@ fn main() {
     // Bounded hand-off from replay_server (S3's REPLAY_REQUEST) to the
     // result publisher thread, which is the sole owner of `result_pub`.
     let (replay_tx, replay_rx) = mpsc::sync_channel::<(u64, u64)>(64);
-    let election = LeaderElection::start(node_id, result_pub, replay_rx);
+    let election = LeaderElection::start(node_id, result_pub, replay_rx, role_atomic, term_atomic);
 
     println!("[order-process] === STEP 5b: Starting S1<->S2 and S2<->S3 Replay Channels ===");
     // Ingest-side sequence tracker: dedups every inbound order by order_id
@@ -164,8 +177,17 @@ fn main() {
     // Marked in the polling thread only, so no lock contention on the
     // decode/dedup hot path beyond this one uncontended mutex (mirrors the
     // existing `wal: Mutex<Wal>` / `state: Mutex<RaftState>` pattern).
-    let tracker = Arc::new(Mutex::new(SequenceTracker::new()));
-    start_replay_client(node_id, cfg.s1_host.clone(), cfg.s1_replay_port, Arc::clone(&tracker));
+    //
+    // Seeded from this node's own WAL (not a fresh watermark of 0) so a
+    // restart doesn't re-accept orders it already committed, and so the
+    // replay client's startup catch-up (below) asks order-sending for
+    // exactly what's actually missing.
+    let resume_from = election.max_committed_order_id();
+    if resume_from > 0 {
+        println!("[order-process] resuming ingest sequence tracker at order_id {resume_from}");
+    }
+    let tracker = Arc::new(Mutex::new(SequenceTracker::with_watermark(resume_from)));
+    start_replay_client(node_id, cfg.s1_host.clone(), cfg.s1_replay_port, Arc::clone(&tracker), resume_from);
     start_replay_server(cfg.bind_host.clone(), self_node.replay_port, Arc::clone(&election), replay_tx);
 
     println!("[order-process] === STEP 6: Spawning Order Ingress Polling Thread & Hot Loop ===");

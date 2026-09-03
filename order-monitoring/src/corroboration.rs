@@ -108,7 +108,7 @@ pub fn start_corroboration_responder(table: HealthTable) {
         for peer in &peers {
             let cached = table.lock().unwrap().get(&peer.id).copied();
             let (reachable, age_ms) = match cached {
-                Some(PeerHealth { reachable, last_seen }) if last_seen.elapsed() < stale_after => {
+                Some(PeerHealth { reachable, last_seen, .. }) if last_seen.elapsed() < stale_after => {
                     (reachable, last_seen.elapsed().as_millis() as u64)
                 }
                 _ => {
