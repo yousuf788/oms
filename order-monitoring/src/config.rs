@@ -18,9 +18,9 @@ impl WatchedNodeAddr {
 }
 
 #[derive(Clone, Debug)]
-pub struct WitnessConfig {
+pub struct monitoringConfig {
     pub bind_host: String,
-    pub witness_port: u16,
+    pub monitoring_port: u16,
     pub nodes: Vec<WatchedNodeAddr>,
     pub poll_interval_ms: u64,
     pub probe_timeout_ms: u64,
@@ -28,7 +28,7 @@ pub struct WitnessConfig {
     pub verbose: bool,
 }
 
-static CONFIG: OnceLock<WitnessConfig> = OnceLock::new();
+static CONFIG: OnceLock<monitoringConfig> = OnceLock::new();
 
 fn env_required(key: &str) -> String {
     env::var(key).unwrap_or_else(|_| {
@@ -59,12 +59,12 @@ fn env_bool(key: &str, default: bool) -> bool {
     }
 }
 
-fn load_from_env() -> WitnessConfig {
+fn load_from_env() -> monitoringConfig {
     let _ = dotenvy::dotenv();
 
-    WitnessConfig {
+    monitoringConfig {
         bind_host: env_or("BIND_HOST", "0.0.0.0"),
-        witness_port: env_u16("WITNESS_PORT", 9101),
+        monitoring_port: env_u16("monitoring_PORT", 9101),
         // Mirrors order-process/.env's NODE{1,2,3}_HOST/_HEALTH_PORT — duplicated
         // rather than shared, since this repo isn't a Cargo workspace and pulling
         // in order-process's config.rs would drag its Aeron/rusteron-client native
@@ -89,18 +89,18 @@ fn load_from_env() -> WitnessConfig {
                 health_port: env_u16("NODE3_HEALTH_PORT", 6103),
             },
         ],
-        poll_interval_ms: env_u64("WITNESS_POLL_INTERVAL_MS", 500),
-        probe_timeout_ms: env_u64("WITNESS_PROBE_TIMEOUT_MS", 400),
-        probe_retries: env_u8("WITNESS_PROBE_RETRIES", 1),
-        verbose: env_bool("VERBOSE_WITNESS", false),
+        poll_interval_ms: env_u64("monitoring_POLL_INTERVAL_MS", 500),
+        probe_timeout_ms: env_u64("monitoring_PROBE_TIMEOUT_MS", 400),
+        probe_retries: env_u8("monitoring_PROBE_RETRIES", 1),
+        verbose: env_bool("VERBOSE_monitoring", false),
     }
 }
 
-pub fn init_config() -> &'static WitnessConfig {
+pub fn init_config() -> &'static monitoringConfig {
     CONFIG.get_or_init(load_from_env)
 }
 
-pub fn config() -> &'static WitnessConfig {
+pub fn config() -> &'static monitoringConfig {
     CONFIG.get().expect("config not initialized; call init_config() first")
 }
 

@@ -21,6 +21,8 @@ This rule specifies mandatory coding standards, performance rules, and memory pa
 - **Pairs to sync**:
   - `OrderWire` in `order-sending/src/main.rs` <===> `OrderWire` in `order-process/src/main.rs`
   - `ReplicatedCommand` in `order-process/src/wal.rs` <===> `ResultWire` in `order-receiver/src/main.rs`
+  - `ReplayRequest` in `order-sending/src/replay.rs` <===> `ReplayRequest` in `order-process/src/replay_client.rs` (S1<->S2 hop)
+  - `ReplayRequest` in `order-process/src/replay_server.rs` <===> `ReplayRequest` in `order-receiver/src/replay_client.rs` (S2<->S3 hop)
 
 ```rust
 // Example: OrderWire definition MUST match on both S1 and S2
@@ -50,10 +52,12 @@ pub struct OrderWire {
 - **Polling Loop**: Aeron subscription polling threads must process incoming fragment batches with `poll_fn`.
 - **Idle Strategy**: Use `BackoffIdleStrategy::new()` or `BusySpinIdleStrategy::default()` to manage CPU spin during zero-fragment poll cycles.
 - **Backpressure Handling**: Cap `offer()` retry counts (e.g., `MAX_BACKPRESSURE_RETRIES = 100_000`) so slow subscribers do not permanently freeze the publisher thread pool.
+- **Fan-out to multiple peers must never block on one**: when publishing the same payload to several nodes (e.g. `order-sending`'s per-node channels), use non-blocking `try_send`/skip semantics per destination, not a blocking send in a loop over destinations — a blocking send to one struggling destination otherwise stalls delivery to every other destination behind it in the loop. This is only safe to do because a skipped destination is recoverable via the replay protocol (see `architecture.md` §3) — don't apply this pattern somewhere that has no such recovery path.
+- **A dedup/sequence-tracking gate before a possibly-lossy hand-off must block, not drop**: if a channel send follows a `SequenceTracker::mark()` (or any other "have I seen this" gate) that would falsely believe the item was handled, that send must be blocking, not `try_send` — a silent drop after marking makes the loss permanently invisible to gap detection.
 
 ---
 
 ## 5. Security & HMAC Authentication
 
-- **Rule**: All inbound network payloads across Aeron streams must pass HMAC verification via `auth::verify` before bincode deserialization.
-- **Key Storage**: Keys MUST be loaded from environment variables (`CLUSTER_HMAC_KEY` and `WITNESS_HMAC_KEY`) via `auth::cluster_key()`. Hardcoding HMAC keys is strictly forbidden.
+- **Rule**: All inbound network payloads across Aeron streams — order channel, result channel, AND both REPLAY_REQUEST control channels — must pass HMAC verification via `auth::verify` before bincode deserialization. `order-receiver` carries its own `auth.rs` (`CLUSTER_HMAC_KEY`) for exactly this reason — it did not need one before the result channel and replay protocol were added.
+- **Key Storage**: Keys MUST be loaded from environment variables (`CLUSTER_HMAC_KEY` and `monitoring_HMAC_KEY`) via `auth::cluster_key()`. Hardcoding HMAC keys is strictly forbidden.

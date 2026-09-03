@@ -36,7 +36,7 @@ Every feature, refactoring, or bug fix MUST be designed with:
 ```
 
 ### Phase 1: Research & Bottleneck Analysis
-- Thoroughly inspect relevant files across all affected crates (`order-process`, `order-sending`, `order-receiver`, `order-witness`).
+- Thoroughly inspect relevant files across all affected crates (`order-process`, `order-sending`, `order-receiver`, `order-monitoring`).
 - Analyze potential performance impacts on 200k–300k TPS target (lock contention, heap allocations, Aeron ring buffer pressure, bincode wire serialization).
 - Review historical benchmarks (`docs/BENCHMARK.md`) and high-level design specs (`docs/HLD.md`).
 - **NO SOURCE CODE CHANGES ARE PERMITTED DURING THIS PHASE.**

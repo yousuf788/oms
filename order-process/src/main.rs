@@ -5,19 +5,22 @@
 //
 // Security: every inbound Aeron order message must carry a valid HMAC-SHA256
 // tag (written by order-sending). Raft control messages use the same key.
-// Witness corroboration messages use a separate WITNESS_HMAC_KEY.
-// Set CLUSTER_HMAC_KEY and WITNESS_HMAC_KEY in .env (openssl rand -hex 32).
+// monitoring corroboration messages use a separate monitoring_HMAC_KEY.
+// Set CLUSTER_HMAC_KEY and monitoring_HMAC_KEY in .env (openssl rand -hex 32).
 
 use order_process::config::{find_node, init_config, node_name, resolve_node_id};
 use order_process::auth;
 use order_process::health_probe::start_health_responder;
 use order_process::leader_election::LeaderElection;
+use order_process::replay_client::start_replay_client;
+use order_process::replay_server::start_replay_server;
+use order_process::sequence_tracker::SequenceTracker;
 use order_process::wal::ReplicatedCommand;
 use rand::Rng;
 use rusteron_client::*;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
 use std::ffi::CString;
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -77,8 +80,8 @@ fn main() {
         node_id, self_node.name, self_node.host, self_node.raft_port, self_node.order_port, self_node.health_port
     );
 
-    println!("[order-process] === STEP 2: Starting Witness Health Probe Responder ===");
-    // Trivial liveness responder for the witness service — independent of Aeron
+    println!("[order-process] === STEP 2: Starting monitoring Health Probe Responder ===");
+    // Trivial liveness responder for the monitoring service — independent of Aeron
     // and the Raft control channel, so it comes up even before either does.
     start_health_responder(node_id, &cfg.bind_host, self_node.health_port);
     println!(
@@ -149,13 +152,28 @@ fn main() {
     println!("[order-process] result channel publication ACTIVE on stream {RESULT_STREAM_ID}");
 
     println!("[order-process] === STEP 5: Starting Raft Consensus Engine ===");
-    let election = LeaderElection::start(node_id, result_pub);
+    // Bounded hand-off from replay_server (S3's REPLAY_REQUEST) to the
+    // result publisher thread, which is the sole owner of `result_pub`.
+    let (replay_tx, replay_rx) = mpsc::sync_channel::<(u64, u64)>(64);
+    let election = LeaderElection::start(node_id, result_pub, replay_rx);
+
+    println!("[order-process] === STEP 5b: Starting S1<->S2 and S2<->S3 Replay Channels ===");
+    // Ingest-side sequence tracker: dedups every inbound order by order_id
+    // across the whole process lifetime (fixing the old per-batch-only
+    // `seen_ids` dedup) and detects gaps for the replay-request ticker.
+    // Marked in the polling thread only, so no lock contention on the
+    // decode/dedup hot path beyond this one uncontended mutex (mirrors the
+    // existing `wal: Mutex<Wal>` / `state: Mutex<RaftState>` pattern).
+    let tracker = Arc::new(Mutex::new(SequenceTracker::new()));
+    start_replay_client(node_id, cfg.s1_host.clone(), cfg.s1_replay_port, Arc::clone(&tracker));
+    start_replay_server(cfg.bind_host.clone(), self_node.replay_port, Arc::clone(&election), replay_tx);
 
     println!("[order-process] === STEP 6: Spawning Order Ingress Polling Thread & Hot Loop ===");
     // Bounded channel to apply backpressure if processing is slower than Aeron delivery
     let (order_tx, order_rx) = crossbeam_channel::bounded::<OrderWire>(500_000);
 
     let poll_tx = order_tx.clone();
+    let poll_tracker = Arc::clone(&tracker);
     thread::spawn(move || {
         let mut idle = BackoffIdleStrategy::new();
         loop {
@@ -165,7 +183,27 @@ fn main() {
                     match auth::verify(buf) {
                         Some(payload) => match bincode::deserialize::<OrderWire>(payload) {
                             Ok(order) => {
-                                let _ = poll_tx.try_send(order);
+                                // Dedup across the process lifetime (not just
+                                // this poll batch) — replayed and Aeron-redelivered
+                                // orders are only forwarded for processing once.
+                                //
+                                // Blocking, not try_send: this channel exists
+                                // specifically so processing slower than
+                                // Aeron delivery backpressures here (see its
+                                // doc comment below) rather than silently
+                                // dropping an order the tracker has already
+                                // marked "seen" — a drop *after* marking
+                                // would be permanently invisible to gap
+                                // detection/replay, defeating the entire
+                                // point of that mechanism. Blocking the
+                                // Aeron polling thread here is safe and
+                                // correct: it naturally throttles fragment
+                                // consumption, which Aeron's own flow
+                                // control then backpressures upstream to
+                                // order-sending.
+                                if poll_tracker.lock().unwrap().mark(order.order_id) {
+                                    let _ = poll_tx.send(order);
+                                }
                             }
                             Err(err) if verbose => eprintln!(
                                 "[order-process] dropped order ({} bytes payload): decode error: {err}",
@@ -187,7 +225,6 @@ fn main() {
 
     let mut last_role_line = String::new();
     let mut batch = Vec::with_capacity(20_000);
-    let mut seen_ids = HashSet::with_capacity(20_000);
 
     println!("[order-process] READY — entering main order batching & consensus loop...");
     loop {
@@ -197,17 +234,14 @@ fn main() {
             last_role_line = line;
         }
 
-        // Gather up to 20,000 orders in a single batch
+        // Gather up to 20,000 orders in a single batch. Dedup already
+        // happened at ingest (poll_tracker, above) — every order reaching
+        // this channel is known-new.
         batch.clear();
-        seen_ids.clear();
-        
+
         while batch.len() < 20_000 {
             match order_rx.try_recv() {
-                Ok(order) => {
-                    if seen_ids.insert(order.order_id) {
-                        batch.push(order);
-                    }
-                }
+                Ok(order) => batch.push(order),
                 Err(_) => break, // channel empty
             }
         }

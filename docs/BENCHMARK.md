@@ -1,11 +1,86 @@
-> **Note:** This document captures the raw-UDP-era benchmark history (pre-Aeron transport,
-> pre-HMAC, pre-binary-wire-format). It predates the 300k orders/sec effort described in
-> `docs/superpowers/specs/2026-09-01-oms-300k-throughput-design.md` and
-> `docs/superpowers/plans/2026-09-01-oms-300k-throughput.md`, and the lab benchmark runbook at
-> `scripts/run_lab_benchmark.md`. Kept for historical reference on the optimizations that got the
-> pipeline to this point; numbers below do not reflect the current Aeron + bincode + HMAC build.
+> **Note:** Sections 1-4 below capture the raw-UDP-era benchmark history (pre-Aeron transport,
+> pre-HMAC, pre-binary-wire-format, pre-replay-protocol). They predate the 300k orders/sec
+> design effort described in `docs/superpowers/specs/2026-09-01-oms-300k-throughput-design.md`
+> and `docs/superpowers/plans/2026-09-01-oms-300k-throughput.md` (both historical planning
+> documents — implemented status noted where relevant), and the lab benchmark runbook at
+> `scripts/run_lab_benchmark.md`. Kept for historical reference on the optimizations that got
+> the pipeline to this point; those numbers do not reflect the current build.
+>
+> **For current, measured results (post-replay-protocol, run against today's code), see
+> §0 below.**
 
 # OMS Order Pipeline Benchmark & Performance Limit Documentation
+
+## 0. Current Results (post-replay-protocol) — 2026-09-03
+
+### 0.1 What changed since the numbers in this document
+
+The order-id sequencing, gap-detection, and REPLAY_REQUEST protocol (S1<->S2, S2<->S3 — see
+`docs/HLD.md` §7) was implemented and then validated by actually running load against it, which
+surfaced two real, previously-latent bugs:
+
+1. **Sender fan-out blocking bug** (`order-sending/src/main.rs`): the fan-out thread did a
+   *blocking* `send()` to each of the 3 per-node channels in sequence. When any one node has no
+   live subscriber (any partial-cluster test, or production with one of 3 replicas down), that
+   node's dedicated publisher thread burns ~100,000 busy-spin retries per message before giving
+   up — and while that happens, its channel fills and blocks the **shared** fan-out thread,
+   stalling delivery to the *other two healthy nodes too*. This directly contradicted the file's
+   own design comment. Fixed with non-blocking `try_send`: a skipped node is safe now because the
+   order is durable in S1's WAL and recoverable via replay.
+2. **Silent-loss-after-mark bug** (`order-process/src/main.rs`, introduced during this same
+   effort): the ingest thread's internal channel used non-blocking `try_send`, gated by
+   `SequenceTracker::mark()`. Under sustained overload, once that channel filled, orders were
+   silently dropped — but since the tracker had *already* marked them "seen," gap detection could
+   never notice they were missing, permanently defeating replay. Fixed with blocking `send()`,
+   since that channel exists specifically to backpressure (per its own doc comment).
+3. **Raft election timeouts too tight for a shared single machine**: under load, leadership
+   flapped continuously (a total stall — see §0.3) because this benchmark runs all 3 Raft nodes
+   plus sender and receiver as *competing processes on one shared, contended machine* (observed
+   load average 6.4/12 with an unrelated desktop environment running). A leader's heartbeat
+   thread can miss a 150-300ms deadline from scheduling delay alone, with no real failure. Real
+   3-machine deployments don't have this problem; `scripts/run_benchmark.sh` widens the timeouts
+   to 100/800/1500ms specifically for this single-machine simulation.
+
+### 0.2 Measured, sustained, zero-loss throughput
+
+Methodology: `scripts/run_benchmark.sh`, which sends for a fixed duration then polls
+`order-receiver`'s log until the received count matches sent (or stabilizes) before scoring —
+not a snapshot immediately after stopping the sender, which would misreport in-flight orders as
+loss. "Clean" below means zero missing `order_id` ranges and zero duplicates.
+
+| Configuration | Sustained clean throughput | Evidence |
+|---|---|---|
+| 1 node (no Raft replication) | **~20,000 orders/sec** | 30s run: 593,920 sent → 595,005 received, 0 missing, 0 duplicates (60s convergence window) |
+| 3 nodes (full Raft replication) | **~7,000-8,000 orders/sec** | 20s run: 137,216 sent → 137,842 received, 0 missing, 0 duplicates |
+
+Both ceilings are **sharp cliffs, not graceful degradation**: pushing past them (e.g. 3-node at
+8,500 TPS, or 1-node at 50,000 TPS sustained for 20s+) produces a large, persistent backlog that
+does not fully drain within a 15-30s convergence window — not because data is lost (a 60s window
+at a rate within the ceiling fully converged with zero loss), but because there's no adaptive
+rate control feeding the sender information about how far behind the receiver is. The gap
+narrows to a small, expected async-WAL-flush artifact when the sender is stopped cleanly within
+capacity; well past capacity, it just keeps growing.
+
+### 0.3 The 200k-300k TPS target has NOT been validated
+
+This is a single shared desktop machine (12 cores, load average ~6.4 from unrelated processes —
+not a dedicated benchmark host) simulating all 3 S2 nodes, the sender, and the receiver at once.
+That is not the same test as the real 3-machine lab deployment this system is designed for (see
+`docs/HLD.md` §1 and `scripts/run_lab_benchmark.md`). Do not read the ~7-20k/sec numbers above as
+a ceiling on the *design* — they're a ceiling on *this specific shared single-machine simulation*.
+The 200k-300k TPS target requires running `scripts/run_lab_benchmark.md`'s procedure on the real
+lab hardware; that has not been done as part of this work.
+
+### 0.4 Zero-loss correctness — what was actually verified
+
+Within each configuration's sustained ceiling: `sent == received` exactly, zero duplicate
+`order_id`s, and zero gaps in the received sequence, confirmed by direct inspection of
+`order-receiver`'s log (not just aggregate counts). This directly exercises the same mechanism
+the original zero-loss requirement asks for — it does not by itself prove exactly-once semantics
+(the system provides at-least-once with idempotent dedup, not exactly-once — see `docs/HLD.md`
+§7) and does not by itself prove the 300k/sec target.
+
+---
 
 ## Executive Summary
 

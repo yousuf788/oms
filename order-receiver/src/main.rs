@@ -2,18 +2,23 @@
 // Subscribes to the result channel that the S2 leader publishes to.
 // Deduplicates by order_id (handles leader failover duplicates).
 
+mod auth;
+mod checkpoint;
 mod config;
+mod replay_client;
+mod sequence_tracker;
 
 use config::init_config;
+use replay_client::start_replay_client;
 use rusteron_client::*;
+use sequence_tracker::SequenceTracker;
 use serde::Deserialize;
-use std::collections::HashSet;
 use std::ffi::CString;
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -147,17 +152,40 @@ fn main() {
         });
     }
 
+    println!("[order-receiver] === STEP 4b: Loading Checkpoint & Starting Replay Client ===");
+    // Restores the dedup/gap watermark from the last checkpoint (0 if none)
+    // instead of assuming nothing has ever been seen, and immediately
+    // issues a catch-up REPLAY_REQUEST to the S2 cluster for anything since
+    // that checkpoint — see checkpoint.rs and replay_client.rs.
+    let start_watermark = checkpoint::load();
+    if start_watermark > 0 {
+        println!("[order-receiver] resuming from checkpoint: last_contiguous={start_watermark}");
+    }
+    let tracker = Arc::new(Mutex::new(SequenceTracker::with_watermark(start_watermark)));
+    checkpoint::start_checkpoint_writer(Arc::clone(&tracker));
+    start_replay_client(cfg.s2_nodes.clone(), Arc::clone(&tracker), start_watermark);
+
     println!("[order-receiver] === STEP 5: Entering Poll Loop for Inbound Result Stream ===");
-    let mut seen_order_ids: HashSet<u64> = HashSet::new();
     let mut idle = BackoffIdleStrategy::new();
 
     println!("[order-receiver] ready, polling for results...");
     loop {
         let fragments = subscription
             .poll_fn(|buf: &[u8], _hdr: AeronHeader| {
-                if let Ok(result) = bincode::deserialize::<ResultWire>(buf) {
-                    if !seen_order_ids.insert(result.order_id) {
-                        return; // deduplicate
+                let Some(payload) = auth::verify(buf) else {
+                    eprintln!(
+                        "[order-receiver] dropped result packet ({} bytes): HMAC failure — check CLUSTER_HMAC_KEY in .env",
+                        buf.len()
+                    );
+                    return;
+                };
+                if let Ok(result) = bincode::deserialize::<ResultWire>(payload) {
+                    // Dedup + gap tracking across the whole process lifetime
+                    // (not just an in-memory HashSet that forgets on
+                    // restart) — replays and leader-failover redeliveries
+                    // are recognized and skipped here.
+                    if !tracker.lock().unwrap().mark(result.order_id) {
+                        return;
                     }
                     let received_ts_ms = now_ms();
                     let line = format!(

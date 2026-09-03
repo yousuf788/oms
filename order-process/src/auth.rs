@@ -6,9 +6,9 @@
 //     Raft control messages (S2 inter-node). Must be identical on every cluster
 //     node (order-sending and all order-process replicas).
 //
-//  2. WITNESS_HMAC_KEY — authenticates corroboration messages between
-//     order-process nodes and the order-witness service. Separate from the
-//     cluster key so the witness never has access to the Raft signing material.
+//  2. monitoring_HMAC_KEY — authenticates corroboration messages between
+//     order-process nodes and the order-monitoring service. Separate from the
+//     cluster key so the monitoring never has access to the Raft signing material.
 //
 // Wire format (all channels):
 //   [ 4 bytes big-endian payload_len ][ payload bytes ][ 32 bytes HMAC-SHA256 ]
@@ -25,7 +25,7 @@ pub const HMAC_TAG_LEN: usize = 32;
 pub const LEN_PREFIX: usize = 4;
 
 static CLUSTER_KEY: OnceLock<Vec<u8>> = OnceLock::new();
-static WITNESS_KEY: OnceLock<Vec<u8>> = OnceLock::new();
+static monitoring_KEY: OnceLock<Vec<u8>> = OnceLock::new();
 
 fn decode_hex_key(hex: &str, env_name: &str) -> Vec<u8> {
     if hex.len() < 32 {
@@ -53,11 +53,11 @@ pub fn cluster_key() -> &'static [u8] {
     })
 }
 
-pub fn witness_key() -> &'static [u8] {
-    WITNESS_KEY.get_or_init(|| {
-        let hex = std::env::var("WITNESS_HMAC_KEY")
-            .expect("WITNESS_HMAC_KEY must be set (hex-encoded ≥32-byte key). Generate: openssl rand -hex 32");
-        decode_hex_key(&hex, "WITNESS_HMAC_KEY")
+pub fn monitoring_key() -> &'static [u8] {
+    monitoring_KEY.get_or_init(|| {
+        let hex = std::env::var("monitoring_HMAC_KEY")
+            .expect("monitoring_HMAC_KEY must be set (hex-encoded ≥32-byte key). Generate: openssl rand -hex 32");
+        decode_hex_key(&hex, "monitoring_HMAC_KEY")
     })
 }
 
@@ -102,11 +102,11 @@ pub fn verify(frame: &[u8]) -> Option<&[u8]> {
     verify_with(frame, cluster_key())
 }
 
-/// Convenience wrappers using the witness key.
-pub fn sign_witness(payload: &[u8]) -> Vec<u8> {
-    sign_with(payload, witness_key())
+/// Convenience wrappers using the monitoring key.
+pub fn sign_monitoring(payload: &[u8]) -> Vec<u8> {
+    sign_with(payload, monitoring_key())
 }
 
-pub fn verify_witness(frame: &[u8]) -> Option<&[u8]> {
-    verify_with(frame, witness_key())
+pub fn verify_monitoring(frame: &[u8]) -> Option<&[u8]> {
+    verify_with(frame, monitoring_key())
 }

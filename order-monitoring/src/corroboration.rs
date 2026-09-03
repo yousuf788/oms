@@ -3,7 +3,7 @@
 // falls back to one fresh synchronous probe rather than answer from outdated data.
 //
 // Security: every inbound request must carry a valid HMAC-SHA256 tag signed with
-// WITNESS_HMAC_KEY. Unauthenticated packets are dropped without a response.
+// monitoring_HMAC_KEY. Unauthenticated packets are dropped without a response.
 // Every outbound response is also signed so order-process nodes can verify it.
 use crate::auth;
 use crate::config::{config, find_node, other_nodes};
@@ -67,11 +67,11 @@ fn append_log(line: &str) {
 
 pub fn start_corroboration_responder(table: HealthTable) {
     let cfg = config();
-    let socket = UdpSocket::bind((cfg.bind_host.as_str(), cfg.witness_port))
-        .expect("failed to bind witness corroboration responder");
+    let socket = UdpSocket::bind((cfg.bind_host.as_str(), cfg.monitoring_port))
+        .expect("failed to bind monitoring corroboration responder");
     println!(
-        "[witness] listening for corroboration requests on {}:{}",
-        cfg.bind_host, cfg.witness_port
+        "[monitoring] listening for corroboration requests on {}:{}",
+        cfg.bind_host, cfg.monitoring_port
     );
 
     let stale_after = Duration::from_millis(cfg.poll_interval_ms.saturating_mul(2));
@@ -85,13 +85,13 @@ pub fn start_corroboration_responder(table: HealthTable) {
         };
 
         // ── HMAC verification ────────────────────────────────────────
-        // Reject any corroboration request that lacks a valid WITNESS_HMAC_KEY
+        // Reject any corroboration request that lacks a valid monitoring_HMAC_KEY
         // signature. Without this, an attacker can forge SafeToPromote responses
         // by replaying or crafting requests to fish for them.
         let inner = match auth::verify(&buf[..n]) {
             Some(p) => p,
             None => {
-                eprintln!("[witness] dropping corroboration request from {src}: HMAC failure");
+                eprintln!("[monitoring] dropping corroboration request from {src}: HMAC failure");
                 continue;
             }
         };
@@ -155,14 +155,14 @@ pub fn start_corroboration_responder(table: HealthTable) {
             format!("{verdict:?}"),
         ));
         println!(
-            "[witness] corroboration request from {requester_label} (term {term}) -> {verdict:?} ({}ms)",
+            "[monitoring] corroboration request from {requester_label} (term {term}) -> {verdict:?} ({}ms)",
             start.elapsed().as_millis()
         );
 
         let response = CorroborationMsg::Response { request_id, peers_checked: checks, verdict };
         if let Ok(inner) = serde_json::to_vec(&response) {
             // Sign the response so order-process nodes can verify it.
-            // A response without a valid HMAC is treated as WitnessUnreachable
+            // A response without a valid HMAC is treated as monitoringUnreachable
             // (fail-safe: stay passive) on the receiving end.
             let frame = auth::sign(&inner);
             let _ = socket.send_to(&frame, src);

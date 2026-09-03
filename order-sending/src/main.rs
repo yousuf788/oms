@@ -10,6 +10,8 @@
 
 mod auth;
 mod config;
+mod replay;
+mod wal;
 
 use config::init_config;
 use rand::Rng;
@@ -17,12 +19,10 @@ use rusteron_client::*;
 use serde::{Deserialize, Serialize};
 use std::ffi::CString;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use std::fs::{create_dir_all, OpenOptions};
-use std::io::Write;
-use std::path::PathBuf;
+use wal::SenderWal;
 
 const ORDER_STREAM_ID: i32 = 1001;
 
@@ -41,10 +41,6 @@ struct OrderWire {
 }
 
 const SYMBOLS: [&str; 3] = ["BTC-USDT", "ETH-USDT", "SOL-USDT"];
-
-fn sent_log_path() -> PathBuf {
-    PathBuf::from("logs").join("orders-sent.log")
-}
 
 fn now_ms() -> u128 {
     SystemTime::now()
@@ -100,34 +96,54 @@ fn main() {
     aeron.start().expect("start aeron client");
     println!("[order-sending] Aeron client successfully connected to media driver");
 
+    println!("[order-sending] === STEP 3b: Opening Order WAL & Resuming Sequence Counter ===");
+    // Durable, replayable record of every order this process generates —
+    // read back here so a restart resumes order_id past whatever was last
+    // durably recorded instead of colliding with previously-sent ids. Also
+    // consulted by the replay listener (replay.rs) to serve REPLAY_REQUEST
+    // ranges from order-process.
+    let wal = Arc::new(Mutex::new(SenderWal::open().expect("failed to open order WAL")));
+    let resume_from = wal.lock().unwrap().last_order_id() + 1;
+    println!("[order-sending] resuming order_id counter at {resume_from}");
+
     // ── Shared counters ────────────────────────────────────────────────────────
-    let order_counter = Arc::new(AtomicU64::new(1));
+    let order_counter = Arc::new(AtomicU64::new(resume_from));
     let sent_total = Arc::new(AtomicU64::new(0));
 
-    println!("[order-sending] === STEP 4: Starting Background Log Writer & Throughput Stats Thread ===");
-    let (log_tx, log_rx) = mpsc::sync_channel::<u64>(1_000_000);
+    println!("[order-sending] === STEP 4: Starting Background WAL Writer & Throughput Stats Thread ===");
+    // Bounded + blocking (not try_send): a full channel here backpressures
+    // the fan-out thread rather than silently dropping the durability
+    // record for an order that was just published live.
+    let (log_tx, log_rx) = mpsc::sync_channel::<OrderWire>(1_000_000);
     {
-        let path = sent_log_path();
+        let wal = Arc::clone(&wal);
         thread::spawn(move || {
-            if let Some(parent) = path.parent() { let _ = create_dir_all(parent); }
-            let mut file = OpenOptions::new().create(true).append(true).open(&path)
-                .expect("cannot open orders-sent.log");
-            let mut buf = String::with_capacity(128 * 1024);
+            // Same 64KB-or-50ms-idle batching pattern as the old text log
+            // writer: accumulate a batch, flush with a single write_all —
+            // never one syscall per order on the hot path.
+            let mut batch: Vec<OrderWire> = Vec::with_capacity(2048);
+            let mut batch_bytes = 0usize;
+            const RECORD_ESTIMATE: usize = 32; // matches wal.rs's per-record capacity hint
             loop {
                 match log_rx.recv_timeout(Duration::from_millis(50)) {
-                    Ok(order_id) => {
-                        buf.push_str(&order_id.to_string()); buf.push('\n');
-                        if buf.len() >= 65536 {
-                            let _ = file.write_all(buf.as_bytes());
-                            let _ = file.flush();
-                            buf.clear();
+                    Ok(order) => {
+                        batch.push(order);
+                        batch_bytes += RECORD_ESTIMATE;
+                        if batch_bytes >= 65536 {
+                            if let Err(e) = wal.lock().unwrap().append_batch(&batch) {
+                                eprintln!("[order-sending] WAL append_batch failed: {e}");
+                            }
+                            batch.clear();
+                            batch_bytes = 0;
                         }
                     }
                     Err(_) => {
-                        if !buf.is_empty() {
-                            let _ = file.write_all(buf.as_bytes());
-                            let _ = file.flush();
-                            buf.clear();
+                        if !batch.is_empty() {
+                            if let Err(e) = wal.lock().unwrap().append_batch(&batch) {
+                                eprintln!("[order-sending] WAL append_batch failed: {e}");
+                            }
+                            batch.clear();
+                            batch_bytes = 0;
                         }
                     }
                 }
@@ -204,6 +220,19 @@ fn main() {
         });
     }
 
+    println!("[order-sending] === STEP 5b: Starting Replay Listener ===");
+    // Cloned before `node_channels` is moved into the fan-out thread below —
+    // the replay listener re-publishes on these same per-node channels, so
+    // a replayed order goes through the identical offer()/retry path as a
+    // live one.
+    let node_channels_for_replay = node_channels.clone();
+    replay::start_replay_listener(
+        cfg.bind_host.clone(),
+        cfg.bind_port,
+        Arc::clone(&wal),
+        node_channels_for_replay,
+    );
+
     // ── Channel: generator threads → fan-out thread ──────────────────────────
     let (payload_tx, payload_rx) = mpsc::sync_channel::<OrderWire>(channel_capacity);
 
@@ -221,11 +250,30 @@ fn main() {
                         let Ok(encoded) = bincode::serialize(&order) else { continue };
                         let frame = Arc::new(auth::sign(&encoded));
                         for node_tx in &node_channels {
-                            if node_tx.send(Arc::clone(&frame)).is_err() {
-                                return; // that node's publisher thread exited
+                            // Non-blocking: a node with no live subscriber (or
+                            // genuinely backpressured) must not stall delivery
+                            // to the other two — that's the whole reason this
+                            // file uses one channel/thread per node (see the
+                            // header comment). Skipping this node for this one
+                            // order is safe because the order is already
+                            // durable in this process's WAL (appended via
+                            // log_tx below): that node's own ingest-side
+                            // sequence tracker will notice the resulting gap
+                            // and pull it back via REPLAY_REQUEST once it can
+                            // process again (see replay.rs / order-process's
+                            // replay_client.rs).
+                            match node_tx.try_send(Arc::clone(&frame)) {
+                                Ok(_) => {}
+                                Err(mpsc::TrySendError::Full(_)) => {}
+                                Err(mpsc::TrySendError::Disconnected(_)) => return,
                             }
                         }
-                        let _ = log_tx.try_send(order.order_id);
+                        // Blocking, not try_send: never silently drop the
+                        // durability record for an order that was just
+                        // handed to the publisher threads.
+                        if log_tx.send(order).is_err() {
+                            return; // WAL writer thread exited
+                        }
                     }
                     Err(_) => break, // all generator threads exited
                 }

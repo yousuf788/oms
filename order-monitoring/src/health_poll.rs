@@ -99,14 +99,14 @@ pub fn start_health_poller() -> HealthTable {
     thread::spawn(move || {
         let cfg = config();
         let socket = UdpSocket::bind((cfg.bind_host.as_str(), 0))
-            .expect("failed to bind witness probe socket");
+            .expect("failed to bind monitoring probe socket");
         let timeout = Duration::from_millis(cfg.probe_timeout_ms);
         loop {
             for node in &cfg.nodes {
                 let mut reachable = probe_once(&socket, &node.host, node.health_port, timeout);
                 if !reachable {
                     if cfg.verbose {
-                        println!("[witness] {} missed probe, retrying...", node.label());
+                        println!("[monitoring] {} missed probe, retrying...", node.label());
                     }
                     for _ in 0..cfg.probe_retries {
                         if probe_once(&socket, &node.host, node.health_port, timeout) {
@@ -131,7 +131,7 @@ pub fn start_health_poller() -> HealthTable {
                         node.host,
                         state
                     ));
-                    println!("[witness] {} is now {state}", node.label());
+                    println!("[monitoring] {} is now {state}", node.label());
                 }
             }
             thread::sleep(Duration::from_millis(cfg.poll_interval_ms));

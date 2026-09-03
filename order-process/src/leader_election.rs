@@ -2,16 +2,17 @@ use crate::auth;
 use crate::config::{
     allow_single_node_leader, election_timeout_max_ms, election_timeout_min_ms, find_node,
     format_role_summary, heartbeat_interval_ms, node_name, peer_silent_ms,
-    require_witness_for_single_node_leader, s2_nodes, verbose_raft, S2Node,
+    require_monitoring_for_single_node_leader, s2_nodes, verbose_raft, S2Node,
 };
 use crate::wal::{LogEntry, ReplicatedCommand, Wal};
-use crate::witness_client::{CachedVerdict, CorroborationOutcome, WitnessClient};
+use crate::monitoring_client::{CachedVerdict, CorroborationOutcome, monitoringClient};
 use rand::Rng;
 use rusteron_client::{AeronPublication, BusySpinIdleStrategy, IdleStrategy};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -142,17 +143,21 @@ pub struct LeaderElection {
     /// allowing single-node self-election. Prevents all nodes self-electing
     /// simultaneously on startup before peers have had a chance to respond.
     started_at: Instant,
-    /// Independent-witness corroboration client — see `witness_loop()` and
+    /// Independent-monitoring corroboration client — see `monitoring_loop()` and
     /// `peers_unreachable()`. A local isolation timeout is never sufficient on
     /// its own to justify self-promotion; this is what corroborates it.
-    witness: WitnessClient,
+    monitoring: monitoringClient,
 }
 
 impl LeaderElection {
     /// Binds the control-channel socket and spawns the background
     /// recv + election/heartbeat ticker threads. Returns immediately;
     /// call `.is_leader()` from anywhere to check current status.
-    pub fn start(self_id: u8, result_pub: AeronPublication) -> Arc<Self> {
+    pub fn start(
+        self_id: u8,
+        result_pub: AeronPublication,
+        replay_rx: Receiver<(u64, u64)>,
+    ) -> Arc<Self> {
         let self_node = find_node(self_id).expect("unknown node id");
         let peers: Vec<S2Node> = s2_nodes()
             .iter()
@@ -208,17 +213,17 @@ impl LeaderElection {
             is_leader_flag: AtomicBool::new(false),
             allowed_ips,
             started_at: Instant::now(),
-            witness: WitnessClient::new(),
+            monitoring: monitoringClient::new(),
         });
 
         println!(
             "[role] {} started as FOLLOWER (waiting for leader)",
             node_name(self_id)
         );
-        if !election.witness.is_configured() && require_witness_for_single_node_leader() {
+        if !election.monitoring.is_configured() && require_monitoring_for_single_node_leader() {
             println!(
-                "[witness] no WITNESS_HOST configured — single-node self-promotion is disabled \
-                 (REQUIRE_WITNESS_FOR_SINGLE_NODE_LEADER=true); set WITNESS_HOST or set that flag \
+                "[monitoring] no monitoring_HOST configured — single-node self-promotion is disabled \
+                 (REQUIRE_monitoring_FOR_SINGLE_NODE_LEADER=true); set monitoring_HOST or set that flag \
                  to false to restore the legacy blind-timeout behavior"
             );
         }
@@ -229,11 +234,11 @@ impl LeaderElection {
         let tick_handle = Arc::clone(&election);
         thread::spawn(move || tick_handle.tick_loop());
 
-        let witness_handle = Arc::clone(&election);
-        thread::spawn(move || witness_handle.witness_loop());
+        let monitoring_handle = Arc::clone(&election);
+        thread::spawn(move || monitoring_handle.monitoring_loop());
 
         let publish_handle = Arc::clone(&election);
-        thread::spawn(move || publish_handle.result_publisher_loop(result_pub));
+        thread::spawn(move || publish_handle.result_publisher_loop(result_pub, replay_rx));
 
         election
     }
@@ -257,14 +262,56 @@ impl LeaderElection {
     /// already deduplicates by `order_id` — and is accepted as simpler than
     /// tracking a persisted publish watermark across restarts, which this
     /// benchmark-proof scope doesn't need.
-    fn result_publisher_loop(&self, result_pub: AeronPublication) {
+    /// Signs and offers one committed entry's command to the result
+    /// channel, retrying while the error is retryable. Used for both live
+    /// commits and replay traffic so the two are indistinguishable on the
+    /// wire (order-receiver dedups either by order_id).
+    fn offer_result(&self, result_pub: &AeronPublication, idle: &mut BusySpinIdleStrategy, command: &ReplicatedCommand) {
+        let Ok(bytes) = bincode::serialize(command) else { return };
+        let frame = auth::sign(&bytes);
+        loop {
+            match result_pub.offer(&frame) {
+                Ok(_) => break,
+                Err(e) if e.is_retryable() => {
+                    idle.idle(0);
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("[S2-{}] result publish error: {e}", self.self_id);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn result_publisher_loop(&self, result_pub: AeronPublication, replay_rx: Receiver<(u64, u64)>) {
         let mut idle = BusySpinIdleStrategy::default();
         let mut last_published: u64 = 0;
         loop {
             if !self.is_leader() {
                 let last_applied = self.state.lock().unwrap().last_applied;
                 last_published = last_applied;
+                // Requests queued while we weren't leader are stale — a
+                // follower must never publish on the result channel.
+                while replay_rx.try_recv().is_ok() {}
                 thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+
+            // Serve one pending replay request (bounded by the WAL scan's
+            // own results) before resuming live publishing, so a S3 replay
+            // request doesn't wait behind unbounded live traffic.
+            if let Ok((from, to)) = replay_rx.try_recv() {
+                let entries = { self.wal.lock().unwrap().entries_with_order_id_range(from, to) };
+                for entry in &entries {
+                    self.offer_result(&result_pub, &mut idle, &entry.command);
+                }
+                if verbose_raft() {
+                    println!(
+                        "[S2-{}] replayed {} committed order(s) (order_id {}..={}) to S3",
+                        self.self_id, entries.len(), from, to
+                    );
+                }
                 continue;
             }
 
@@ -278,31 +325,14 @@ impl LeaderElection {
             let entry = { self.wal.lock().unwrap().entry_at(next) };
             match entry {
                 Some(entry) => {
-                    if let Ok(bytes) = bincode::serialize(&entry.command) {
-                        loop {
-                            match result_pub.offer(&bytes) {
-                                Ok(_) => break,
-                                Err(e) if e.is_retryable() => {
-                                    idle.idle(0);
-                                    continue;
-                                }
-                                Err(e) => {
-                                    eprintln!(
-                                        "[S2-{}] result publish error: {e}",
-                                        self.self_id
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                        if verbose_raft() {
-                            println!(
-                                "[order] {} LEADER committed order_id={} status={} filled={}/{}",
-                                node_name(self.self_id), entry.command.order_id,
-                                entry.command.status, entry.command.filled_qty,
-                                entry.command.qty,
-                            );
-                        }
+                    self.offer_result(&result_pub, &mut idle, &entry.command);
+                    if verbose_raft() {
+                        println!(
+                            "[order] {} LEADER committed order_id={} status={} filled={}/{}",
+                            node_name(self.self_id), entry.command.order_id,
+                            entry.command.status, entry.command.filled_qty,
+                            entry.command.qty,
+                        );
                     }
                     last_published = next;
                 }
@@ -546,7 +576,7 @@ impl LeaderElection {
         if self.alive_node_count(st) != 1 {
             return false;
         }
-        if !require_witness_for_single_node_leader() {
+        if !require_monitoring_for_single_node_leader() {
             // Legacy blind-timeout path (opt-out flag, local demo only) — a local
             // timeout alone is treated as sufficient, exactly as before this change.
             return true;
@@ -554,23 +584,23 @@ impl LeaderElection {
         // A local timeout alone is never sufficient: this node cannot tell from the
         // inside whether both peers are genuinely down or whether it's the one that
         // got partitioned while its peers formed their own quorum. Promotion requires
-        // the independent witness's corroboration (see `witness_loop()`). No witness
+        // the independent monitoring's corroboration (see `monitoring_loop()`). No monitoring
         // reachable is treated identically to "peers confirmed still up" — uncertainty
         // always resolves to staying passive, never to promoting.
-        self.witness.cached_verdict() == CachedVerdict::SafeToPromote
+        self.monitoring.cached_verdict() == CachedVerdict::SafeToPromote
     }
 
     /// Background thread: while this node looks locally isolated (per
     /// `peers_unreachable`'s own timeout check), periodically asks the independent
-    /// witness to corroborate before caching a verdict `peers_unreachable()` can act
+    /// monitoring to corroborate before caching a verdict `peers_unreachable()` can act
     /// on. Runs on its own cadence, independent of `tick_loop`'s 50ms cycle, and never
-    /// performs I/O while holding `state`'s lock — a witness round-trip can take up to
-    /// `WITNESS_TIMEOUT_MS`, which would otherwise stall `recv_loop` and all consensus.
-    fn witness_loop(&self) {
+    /// performs I/O while holding `state`'s lock — a monitoring round-trip can take up to
+    /// `monitoring_TIMEOUT_MS`, which would otherwise stall `recv_loop` and all consensus.
+    fn monitoring_loop(&self) {
         loop {
             thread::sleep(Duration::from_millis(250));
 
-            if !allow_single_node_leader() || !require_witness_for_single_node_leader() {
+            if !allow_single_node_leader() || !require_monitoring_for_single_node_leader() {
                 continue;
             }
 
@@ -581,31 +611,31 @@ impl LeaderElection {
             };
 
             if !isolated {
-                self.witness.reset_if_not_isolated();
+                self.monitoring.reset_if_not_isolated();
                 continue;
             }
 
-            if !self.witness.due_for_attempt() {
+            if !self.monitoring.due_for_attempt() {
                 continue;
             }
 
             let term = self.current_term();
-            let (outcome, changed) = self.witness.attempt_corroboration(self.self_id, term);
+            let (outcome, changed) = self.monitoring.attempt_corroboration(self.self_id, term);
             if changed {
                 let name = node_name(self.self_id);
                 match outcome {
                     CorroborationOutcome::SafeToPromote => println!(
-                        "[witness] corroboration confirmed both peers unreachable — {name} eligible to self-promote"
+                        "[monitoring] corroboration confirmed both peers unreachable — {name} eligible to self-promote"
                     ),
-                    CorroborationOutcome::DeniedByWitness => println!(
-                        "[witness] corroboration denied: witness reports a peer still reachable — {name} staying passive"
+                    CorroborationOutcome::DeniedBymonitoring => println!(
+                        "[monitoring] corroboration denied: monitoring reports a peer still reachable — {name} staying passive"
                     ),
-                    CorroborationOutcome::WitnessUnreachable => println!(
-                        "[witness] witness unreachable after {}ms — {name} staying passive",
-                        crate::config::witness_timeout_ms()
+                    CorroborationOutcome::monitoringUnreachable => println!(
+                        "[monitoring] monitoring unreachable after {}ms — {name} staying passive",
+                        crate::config::monitoring_timeout_ms()
                     ),
                     CorroborationOutcome::NotConfigured => println!(
-                        "[witness] no witness configured — {name} staying passive (REQUIRE_WITNESS_FOR_SINGLE_NODE_LEADER=true)"
+                        "[monitoring] no monitoring configured — {name} staying passive (REQUIRE_monitoring_FOR_SINGLE_NODE_LEADER=true)"
                     ),
                 }
             }
@@ -668,10 +698,10 @@ impl LeaderElection {
         st.leader_since_term = st.term;
         self.is_leader_flag.store(true, Ordering::Relaxed);
         if self.peers_unreachable(st) {
-            let mode = if !require_witness_for_single_node_leader() {
+            let mode = if !require_monitoring_for_single_node_leader() {
                 "legacy blind timeout"
             } else {
-                "witness-corroborated"
+                "monitoring-corroborated"
             };
             println!(
                 "[role] {} is LEADER (single-node: other machines unreachable, {mode})",

@@ -1,10 +1,10 @@
-// auth.rs — HMAC-SHA256 message authentication for the witness corroboration channel.
+// auth.rs — HMAC-SHA256 message authentication for the monitoring corroboration channel.
 //
 // Wire format:
 //   [ 4 bytes big-endian payload_len ][ payload bytes ][ 32 bytes HMAC-SHA256 ]
 //
-// Key source: WITNESS_HMAC_KEY env var (hex-encoded ≥32-byte key).
-// Must be identical on the witness service AND all order-process nodes.
+// Key source: monitoring_HMAC_KEY env var (hex-encoded ≥32-byte key).
+// Must be identical on the monitoring service AND all order-process nodes.
 //
 // Generate with: openssl rand -hex 32
 
@@ -17,7 +17,7 @@ type HmacSha256 = Hmac<Sha256>;
 pub const HMAC_TAG_LEN: usize = 32;
 pub const LEN_PREFIX: usize = 4;
 
-static WITNESS_KEY: OnceLock<Vec<u8>> = OnceLock::new();
+static monitoring_KEY: OnceLock<Vec<u8>> = OnceLock::new();
 
 fn decode_hex_key(hex: &str, env_name: &str) -> Vec<u8> {
     if hex.len() < 32 {
@@ -37,17 +37,17 @@ fn decode_hex_key(hex: &str, env_name: &str) -> Vec<u8> {
         .collect()
 }
 
-pub fn witness_key() -> &'static [u8] {
-    WITNESS_KEY.get_or_init(|| {
-        let hex = std::env::var("WITNESS_HMAC_KEY")
-            .expect("WITNESS_HMAC_KEY must be set (hex-encoded ≥32-byte key). Generate: openssl rand -hex 32");
-        decode_hex_key(&hex, "WITNESS_HMAC_KEY")
+pub fn monitoring_key() -> &'static [u8] {
+    monitoring_KEY.get_or_init(|| {
+        let hex = std::env::var("monitoring_HMAC_KEY")
+            .expect("monitoring_HMAC_KEY must be set (hex-encoded ≥32-byte key). Generate: openssl rand -hex 32");
+        decode_hex_key(&hex, "monitoring_HMAC_KEY")
     })
 }
 
 /// Build wire frame: `[4-byte big-endian len][payload][32-byte HMAC]`
 pub fn sign(payload: &[u8]) -> Vec<u8> {
-    let key = witness_key();
+    let key = monitoring_key();
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key always valid");
     mac.update(payload);
     let tag = mac.finalize().into_bytes();
@@ -72,7 +72,7 @@ pub fn verify(frame: &[u8]) -> Option<&[u8]> {
     let payload = &frame[LEN_PREFIX..LEN_PREFIX + len];
     let tag = &frame[LEN_PREFIX + len..LEN_PREFIX + len + HMAC_TAG_LEN];
 
-    let key = witness_key();
+    let key = monitoring_key();
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC key always valid");
     mac.update(payload);
     mac.verify_slice(tag).ok()?; // constant-time — no timing oracle

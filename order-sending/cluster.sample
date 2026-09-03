@@ -12,3 +12,7 @@ NODE2_ORDER_PORT=7002
 
 NODE3_HOST=10.10.1.69
 NODE3_ORDER_PORT=7003
+
+# Required — same value as order-process's CLUSTER_HMAC_KEY on every machine.
+# Generate with: openssl rand -hex 32
+CLUSTER_HMAC_KEY=REPLACE_WITH_OUTPUT_OF__openssl_rand_-hex_32

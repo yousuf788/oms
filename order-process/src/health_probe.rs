@@ -1,7 +1,7 @@
-// Trivial, stateless liveness responder used only by the witness service to test
+// Trivial, stateless liveness responder used only by the monitoring service to test
 // whether this node's process is up. Deliberately kept on its own socket/port and
 // completely decoupled from the Raft control channel (`leader_election.rs`) and its
-// `Message` enum/`RaftState` — a witness probe must never be able to perturb
+// `Message` enum/`RaftState` — a monitoring probe must never be able to perturb
 // consensus state or be misread as a Raft message.
 
 use serde::{Deserialize, Serialize};

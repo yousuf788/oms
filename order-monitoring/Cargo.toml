@@ -1,10 +1,10 @@
 [package]
-name = "order-witness"
+name = "order-monitoring"
 version = "0.1.0"
 edition = "2021"
 
 [[bin]]
-name = "order-witness"
+name = "order-monitoring"
 path = "src/main.rs"
 
 [dependencies]

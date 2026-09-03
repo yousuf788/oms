@@ -1,0 +1,63 @@
+# order-process cluster config
+# Copy to `.env` on every order-process machine: cp cluster.sample .env
+
+BIND_HOST=0.0.0.0
+
+# ---- Node 1 (Nitin) ----
+NODE1_NAME=Nitin
+NODE1_HOST=172.16.12.104
+NODE1_RAFT_PORT=6001
+NODE1_ORDER_PORT=7001
+NODE1_HEALTH_PORT=6101
+NODE1_REPLAY_PORT=6201
+
+# ---- Node 2 (Amit) ----
+NODE2_NAME=Amit
+NODE2_HOST=172.16.13.181
+NODE2_RAFT_PORT=6002
+NODE2_ORDER_PORT=7002
+NODE2_HEALTH_PORT=6102
+NODE2_REPLAY_PORT=6202
+
+# ---- Node 3 (Yousuf) ----
+NODE3_NAME=Yousuf
+NODE3_HOST=10.10.1.69
+NODE3_RAFT_PORT=6003
+NODE3_ORDER_PORT=7003
+NODE3_HEALTH_PORT=6103
+NODE3_REPLAY_PORT=6203
+
+# order-receiver on Yousuf (same host as node 3)
+S3_HOST=10.10.1.69
+S3_PORT=8001
+
+# order-sending's replay listener (S1<->S2 gap-recovery protocol) — wherever
+# order-sending actually runs; S1_REPLAY_PORT matches its SENDER_BIND_PORT.
+S1_HOST=<order-sending machine IP>
+S1_REPLAY_PORT=9001
+
+HEARTBEAT_INTERVAL_MS=100
+ELECTION_TIMEOUT_MIN_MS=300
+ELECTION_TIMEOUT_MAX_MS=600
+
+# Lab failover: remaining node becomes leader if peers silent this long (ms) AND
+# order-monitoring corroborates that both peers are genuinely unreachable.
+ALLOW_SINGLE_NODE_LEADER=true
+PEER_SILENT_MS=2000
+
+# Run order-monitoring on independent infrastructure (not one of the 3 nodes above) —
+# see order-monitoring/.env.example. Must match its NODE*_HOST/_HEALTH_PORT exactly.
+# NOTE: casing below is exact and load-bearing (a leftover of the order-witness->
+# order-monitoring rename that didn't normalize case) — get it wrong and the var is
+# silently unset. See CLAUDE.md section 6.
+monitoring_HOST=<monitoring machine IP>
+monitoring_PORT=9101
+monitoring_TIMEOUT_MS=1500
+monitoring_RETRY_INTERVAL_MS=2000
+REQUIRE_monitoring_FOR_SINGLE_NODE_LEADER=true
+
+# Required — generate with: openssl rand -hex 32 (same value on every order-process
+# node, order-sending, and order-receiver)
+CLUSTER_HMAC_KEY=REPLACE_WITH_OUTPUT_OF__openssl_rand_-hex_32
+# Required if monitoring_HOST is set above — same value as order-monitoring's .env
+monitoring_HMAC_KEY=REPLACE_WITH_OUTPUT_OF__openssl_rand_-hex_32

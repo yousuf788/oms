@@ -1,11 +1,11 @@
 ---
 name: start-cluster
-description: Configure environment files and launch the multi-node S2 cluster, S1 sender, S3 receiver, and Witness
+description: Configure environment files and launch the multi-node S2 cluster, S1 sender, S3 receiver, and monitoring
 ---
 
 # Skill: Start Cluster (Local or Multi-Machine)
 
-Use this skill when starting up the 3-replica `order-process` cluster, `order-sending`, `order-receiver`, and `order-witness`.
+Use this skill when starting up the 3-replica `order-process` cluster, `order-sending`, `order-receiver`, and `order-monitoring`.
 
 ## Workflow Steps
 
@@ -17,8 +17,16 @@ Verify or populate `.env` files in all 4 crate directories:
 cd /data/Antier-project/Exchange/oms/order-process && [ -f .env ] || cp .env.example .env
 cd /data/Antier-project/Exchange/oms/order-sending && [ -f .env ] || cp .env.example .env
 cd /data/Antier-project/Exchange/oms/order-receiver && [ -f .env ] || cp .env.example .env
-cd /data/Antier-project/Exchange/oms/order-witness && [ -f .env ] || cp .env.example .env
+cd /data/Antier-project/Exchange/oms/order-monitoring && [ -f .env ] || cp .env.example .env
 ```
+
+> [!IMPORTANT]
+> `.env.example` files ship with `CLUSTER_HMAC_KEY`/`monitoring_HMAC_KEY` placeholders
+> (`REPLACE_WITH_OUTPUT_OF__openssl_rand_-hex_32`) — generate real keys and put the **same**
+> `CLUSTER_HMAC_KEY` into `order-sending/.env`, every `order-process/.env`, AND
+> `order-receiver/.env` (it now verifies the result channel and signs replay requests — it
+> didn't need a key at all before). `order-process` also now requires `S1_HOST`/`S1_REPLAY_PORT`
+> (where order-sending's replay listener is) with no default host — see `CLAUDE.md` §6.
 
 ### Step 2: Start `order-process` S2 Nodes
 
@@ -48,8 +56,8 @@ Run each service in separate terminal windows:
 # Start S3 Result Receiver
 cd /data/Antier-project/Exchange/oms/order-receiver && cargo run --release
 
-# Start Independent Witness Arbiter
-cd /data/Antier-project/Exchange/oms/order-witness && cargo run --release
+# Start Independent monitoring Arbiter
+cd /data/Antier-project/Exchange/oms/order-monitoring && cargo run --release
 
 # Start S1 Order Generator
 cd /data/Antier-project/Exchange/oms/order-sending && cargo run --release
@@ -60,7 +68,12 @@ Check terminal console for the role summary line:
 ```text
 [role] Nitin is LEADER; Amit is FOLLOWER; Yousuf is FOLLOWER
 ```
-Confirm log files are being updated:
-- `order-sending/logs/orders-sent.log`
+If instead the role keeps cycling between all 3 names, see `diagnose-cluster` scenario 6
+(CPU contention / election timeout tuning) before assuming something is broken.
+
+Confirm log files are being updated (the first two are now binary — length-prefixed
+bincode, not line-per-order text; don't `cat`/`grep` them):
+- `order-sending/logs/orders-sent.wal`
 - `order-process/logs/orders-processed.log`
-- `order-receiver/logs/orders-received.log`
+- `order-receiver/logs/orders-received.log` (text)
+- `order-receiver/logs/receiver-checkpoint.dat` (text, updates every ~200ms)

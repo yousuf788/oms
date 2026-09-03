@@ -14,7 +14,7 @@ This rule specifies requirements for handling configuration, environment variabl
 
 ## 2. Mandatory Environment Variables
 
-Every `.env` file in `order-process`, `order-sending`, `order-receiver`, and `order-witness` must define:
+Every `.env` file in `order-process`, `order-sending`, `order-receiver`, and `order-monitoring` must define:
 
 ```env
 # Cluster Host Addresses
@@ -35,16 +35,30 @@ NODE1_HEALTH_PORT=6101
 NODE2_HEALTH_PORT=6102
 NODE3_HEALTH_PORT=6103
 
+# S2<->S3 replay-request ports (order-receiver broadcasts REPLAY_REQUEST here)
+NODE1_REPLAY_PORT=6201
+NODE2_REPLAY_PORT=6202
+NODE3_REPLAY_PORT=6203
+
 S3_HOST=127.0.0.1
 S3_PORT=8001
 
-WITNESS_HOST=127.0.0.1
-WITNESS_PORT=9101
+# order-sending's replay listener — required on every order-process node
+S1_HOST=127.0.0.1
+S1_REPLAY_PORT=9001
+
+monitoring_HOST=127.0.0.1
+monitoring_PORT=9101
 
 # Security Keys
 CLUSTER_HMAC_KEY=0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
-WITNESS_HMAC_KEY=fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
+monitoring_HMAC_KEY=fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210
 ```
+
+> [!CAUTION]
+> `REQUIRE_monitoring_FOR_SINGLE_NODE_LEADER`'s casing is exact and load-bearing — it is not `REQUIRE_MONITORING_FOR_SINGLE_NODE_LEADER`. This is a leftover artifact of the order-witness→order-monitoring rename that didn't normalize case when "witness" became "monitoring" (same root cause as the `monitoringClient`/`monitoring_KEY` Rust identifier naming). Get the casing wrong in a `.env` or an exported shell var and it's silently treated as unset — which defaults to `true`, not an error.
+>
+> `order-receiver` now requires `CLUSTER_HMAC_KEY` and a full `NODE1/2/3_HOST` + `NODE1/2/3_REPLAY_PORT` list (to verify the result channel's HMAC and broadcast `REPLAY_REQUEST`) — it previously needed almost no configuration.
 
 ---
 

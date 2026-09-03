@@ -167,6 +167,24 @@ impl Wal {
         self.entries[start..].to_vec()
     }
 
+    /// Committed entries whose `command.order_id` falls in `[from, to]`
+    /// (inclusive; `to = u64::MAX` means "everything from `from` onward").
+    /// Serves REPLAY_REQUEST for the S2->S3 hop, where the caller only
+    /// knows order_id, not this WAL's Raft `index` — the two aren't
+    /// guaranteed identical (see replay_server.rs), so this is a linear
+    /// scan of in-memory entries rather than an indexed lookup. That's
+    /// acceptable for a rare, bounded, control-path operation; if this ever
+    /// shows up as a hot path, add a secondary order_id index (deferred —
+    /// this system also has no WAL retention/truncation yet, so `entries`
+    /// only grows for the life of the process either way).
+    pub fn entries_with_order_id_range(&self, from: u64, to: u64) -> Vec<LogEntry> {
+        self.entries
+            .iter()
+            .filter(|e| e.command.order_id >= from && e.command.order_id <= to)
+            .cloned()
+            .collect()
+    }
+
     pub fn entry_at(&self, index: u64) -> Option<LogEntry> {
         if index == 0 {
             return None;
