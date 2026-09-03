@@ -29,10 +29,6 @@ fn env_required(key: &str) -> String {
     })
 }
 
-fn env_or(key: &str, default: &str) -> String {
-    env::var(key).unwrap_or_else(|_| default.to_string())
-}
-
 fn env_u16(key: &str, default: u16) -> u16 {
     env::var(key)
         .ok()
@@ -44,7 +40,7 @@ fn load_from_env() -> ReceiverConfig {
     let _ = dotenvy::dotenv();
 
     ReceiverConfig {
-        bind_host: env_or("BIND_HOST", "0.0.0.0"),
+        bind_host: env_required("BIND_HOST"),
         bind_port: env_u16("S3_PORT", 8001),
         s2_nodes: vec![
             S2NodeAddr {

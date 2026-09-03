@@ -114,7 +114,7 @@ fn load_from_env() -> ClusterConfig {
                 replay_port: env_u16("NODE3_REPLAY_PORT", 6203),
             },
         ],
-        bind_host: env_or("BIND_HOST", "0.0.0.0"),
+        bind_host: env_required("BIND_HOST"),
         s3_host: env_required("S3_HOST"),
         s3_port: env_u16("S3_PORT", 8001),
         heartbeat_interval_ms: env_u64("HEARTBEAT_INTERVAL_MS", 50),

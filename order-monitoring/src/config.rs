@@ -63,7 +63,7 @@ fn load_from_env() -> MonitoringConfig {
     let _ = dotenvy::dotenv();
 
     MonitoringConfig {
-        bind_host: env_or("BIND_HOST", "0.0.0.0"),
+        bind_host: env_required("BIND_HOST"),
         monitoring_port: env_u16("monitoring_PORT", 9101),
         // Mirrors order-process/.env's NODE{1,2,3}_HOST/_HEALTH_PORT — duplicated
         // rather than shared, since this repo isn't a Cargo workspace and pulling
