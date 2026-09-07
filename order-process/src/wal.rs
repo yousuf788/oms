@@ -43,27 +43,42 @@ fn write_framed_entry(buf: &mut Vec<u8>, entry: &LogEntry) -> io::Result<()> {
 /// (without erroring) at a truncated trailing record — e.g. a length header
 /// with no body yet, from a process killed mid-write — since the WAL's
 /// durability model is OS-buffered writes, not fsync'd transactions.
-fn read_framed_entries(bytes: &[u8]) -> Vec<LogEntry> {
+/// Same framing as `read_framed_entries`, but also returns each entry's
+/// starting byte offset in `bytes` (the position of its 4-byte length
+/// header) so a caller can later `set_len()` the file back to a point
+/// between two entries without rewriting anything.
+fn read_framed_entries_with_offsets(bytes: &[u8]) -> Vec<(u64, LogEntry)> {
     let mut entries = Vec::new();
     let mut pos = 0usize;
     while pos + 4 <= bytes.len() {
+        let record_start = pos;
         let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
         pos += 4;
         if pos + len > bytes.len() {
             break;
         }
         if let Ok(entry) = bincode::deserialize::<LogEntry>(&bytes[pos..pos + len]) {
-            entries.push(entry);
+            entries.push((record_start as u64, entry));
         }
         pos += len;
     }
     entries
 }
 
+#[cfg(test)]
+fn read_framed_entries(bytes: &[u8]) -> Vec<LogEntry> {
+    read_framed_entries_with_offsets(bytes).into_iter().map(|(_, entry)| entry).collect()
+}
+
 pub struct Wal {
     path: PathBuf,
     file: fs::File,
     entries: Vec<LogEntry>,
+    // Parallel to `entries`: the byte offset (start of the length prefix) of
+    // each entry's on-disk record. Lets `truncate_from` discard a conflicting
+    // tail with a single `set_len()` instead of rewriting the whole file.
+    offsets: Vec<u64>,
+    file_len: u64,
 }
 
 impl Wal {
@@ -77,11 +92,12 @@ impl Wal {
         } else {
             base_dir.join("orders-processed.log")
         };
-        let entries = Self::load_entries(&path)?;
+        let (entries, offsets) = Self::load_entries(&path)?;
         let file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)?;
+        let file_len = fs::metadata(&path)?.len();
 
         if crate::config::verbose_raft() {
             println!(
@@ -91,42 +107,46 @@ impl Wal {
                 entries.last().map(|e| e.index).unwrap_or(0)
             );
         }
-        Ok(Self { path, file, entries })
+        Ok(Self { path, file, entries, offsets, file_len })
     }
 
-    fn load_entries(path: &PathBuf) -> io::Result<Vec<LogEntry>> {
+    fn load_entries(path: &PathBuf) -> io::Result<(Vec<LogEntry>, Vec<u64>)> {
         if !path.exists() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
         let bytes = fs::read(path)?;
-        let mut entries = read_framed_entries(&bytes);
-        entries.sort_by_key(|entry| entry.index);
-        Ok(entries)
+        let mut pairs = read_framed_entries_with_offsets(&bytes);
+        pairs.sort_by_key(|(_, entry)| entry.index);
+        let (offsets, entries) = pairs.into_iter().unzip();
+        Ok((entries, offsets))
     }
 
     fn append_single_entry(&mut self, entry: &LogEntry) -> io::Result<()> {
         let mut buf = Vec::new();
         write_framed_entry(&mut buf, entry)?;
+        self.offsets.push(self.file_len);
         self.file.write_all(&buf)?;
+        self.file_len += buf.len() as u64;
         Ok(())
     }
 
-    fn rewrite_all(&mut self) -> io::Result<()> {
-        let mut buf = Vec::new();
-        for entry in &self.entries {
-            write_framed_entry(&mut buf, entry)?;
+    /// Discards every locally-stored entry with `index >= from_index` — both
+    /// the in-memory Vec and the on-disk bytes — via one `set_len()` to the
+    /// byte offset of that entry, instead of rewriting every entry before it.
+    /// Only reached on a genuine Raft log conflict (differing term at the
+    /// same index); the documented leader-flapping failure mode can trigger
+    /// this repeatedly, so keeping it O(1) rather than O(WAL size) matters
+    /// on the consensus hot path.
+    fn truncate_from(&mut self, from_index: u64) -> io::Result<()> {
+        let split = self.entries.partition_point(|entry| entry.index < from_index);
+        if split >= self.entries.len() {
+            return Ok(());
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        file.write_all(&buf)?;
-        file.flush()?;
-        self.file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&self.path)?;
+        let offset = self.offsets[split];
+        self.entries.truncate(split);
+        self.offsets.truncate(split);
+        self.file.set_len(offset)?;
+        self.file_len = offset;
         Ok(())
     }
 
@@ -266,12 +286,17 @@ impl Wal {
     ) -> io::Result<Vec<LogEntry>> {
         let mut entries = Vec::with_capacity(commands.len());
         let mut buf = Vec::with_capacity(commands.len() * 96);
+        let mut offset = self.file_len;
         for (index, command) in (self.last_index() + 1..).zip(commands) {
             let entry = LogEntry { index, term, command };
+            let before = buf.len();
             write_framed_entry(&mut buf, &entry)?;
+            self.offsets.push(offset);
+            offset += (buf.len() - before) as u64;
             entries.push(entry);
         }
         self.file.write_all(&buf)?;
+        self.file_len = offset;
         self.entries.extend(entries.clone());
         Ok(entries)
     }
@@ -289,23 +314,18 @@ impl Wal {
             return Ok(None);
         }
 
-        let mut truncated = false;
         for incoming in incoming_entries {
             if let Some(existing) = self.entry_at(incoming.index) {
                 if existing.term != incoming.term {
-                    self.entries.retain(|entry| entry.index < incoming.index);
+                    self.truncate_from(incoming.index)?;
+                    self.append_single_entry(incoming)?;
                     self.entries.push(incoming.clone());
-                    truncated = true;
                 }
+                // else: identical entry already present — nothing to do.
             } else {
                 self.append_single_entry(incoming)?;
                 self.entries.push(incoming.clone());
             }
-        }
-
-        if truncated {
-            self.entries.sort_by_key(|entry| entry.index);
-            self.rewrite_all()?;
         }
         Ok(Some(self.last_index()))
     }

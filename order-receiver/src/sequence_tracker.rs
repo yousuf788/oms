@@ -13,6 +13,16 @@ use std::collections::HashSet;
 
 const WINDOW: u64 = 1_048_576;
 const WORDS: usize = (WINDOW / 64) as usize;
+/// Bounds `overflow`'s memory when a gap outlives the ring-bitset window
+/// (e.g. sustained backpressure or a leader-flapping episode) — without a
+/// cap, `overflow` grows without bound for as long as the gap stays open,
+/// risking OOM at 200k-300k TPS. This is the documented "cliff, not
+/// graceful degradation" scenario (see CLAUDE.md's troubleshooting table):
+/// once capped, further far-ahead ids are treated as new without exact
+/// dedup rather than growing memory further — bounded memory at the cost
+/// of possible duplicate log entries, which the at-least-once delivery
+/// model already tolerates.
+const OVERFLOW_CAP: usize = WINDOW as usize;
 
 pub struct SequenceTracker {
     last_contiguous: u64,
@@ -55,8 +65,16 @@ impl SequenceTracker {
             let was_set = self.bits[word] & bit != 0;
             self.bits[word] |= bit;
             !was_set
+        } else if self.overflow.len() < OVERFLOW_CAP {
+            let was_new = self.overflow.insert(order_id);
+            if was_new && self.overflow.len() == OVERFLOW_CAP {
+                eprintln!(
+                    "[sequence_tracker] overflow set reached its {OVERFLOW_CAP}-entry cap — a gap has outlived the {WINDOW}-id tracking window; further far-ahead ids will be treated as new without exact dedup until the gap closes"
+                );
+            }
+            was_new
         } else {
-            self.overflow.insert(order_id)
+            true
         };
 
         loop {

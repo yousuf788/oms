@@ -342,6 +342,14 @@ impl LeaderElection {
             if let Ok((from, to)) = replay_rx.try_recv() {
                 let entries = { self.wal.lock().unwrap().entries_with_order_id_range(from, to) };
                 for entry in &entries {
+                    // Leadership can be lost mid-burst (e.g. a higher-term
+                    // AppendEntries arrives on recv_loop while we're partway
+                    // through a large S3 catch-up replay) — followers must
+                    // stay silent on the result channel, so stop immediately
+                    // rather than finishing the burst.
+                    if !self.is_leader() {
+                        break;
+                    }
                     self.offer_result(&result_pub, &mut idle, &entry.command);
                 }
                 if verbose_raft() {
@@ -818,33 +826,48 @@ impl LeaderElection {
             return;
         }
 
-        let wal = self.wal.lock().unwrap();
-        let leader_last = wal.last_index();
+        // Build every peer's AppendEntries payload while the WAL lock is held,
+        // then drop the lock before doing any network I/O — holding a state
+        // lock across a blocking socket send stalls every other thread
+        // waiting on this Mutex (propose_batch, apply_committed_entries,
+        // result_publisher_loop) for as long as the slowest peer's send()
+        // takes.
+        let outgoing: Vec<(&S2Node, u64, u64, Vec<LogEntry>)> = {
+            let wal = self.wal.lock().unwrap();
+            let leader_last = wal.last_index();
 
-        for peer in &self.peers {
-            let next_idx = next_map.get(&peer.id).copied().unwrap_or(leader_last + 1);
-            let prev_log_index = next_idx.saturating_sub(1);
-            let prev_log_term = wal.get_term_at(prev_log_index).unwrap_or(0);
-            let entries = if next_idx <= leader_last {
-                entries_within_budget(
-                    wal.entries_from_capped(next_idx, MAX_REPLICATE_LOOKAHEAD_ENTRIES),
-                    APPEND_BATCH_BYTE_BUDGET,
-                )
-            } else {
-                Vec::new()
-            };
+            self.peers
+                .iter()
+                .map(|peer| {
+                    let next_idx = next_map.get(&peer.id).copied().unwrap_or(leader_last + 1);
+                    let prev_log_index = next_idx.saturating_sub(1);
+                    let prev_log_term = wal.get_term_at(prev_log_index).unwrap_or(0);
+                    let entries = if next_idx <= leader_last {
+                        entries_within_budget(
+                            wal.entries_from_capped(next_idx, MAX_REPLICATE_LOOKAHEAD_ENTRIES),
+                            APPEND_BATCH_BYTE_BUDGET,
+                        )
+                    } else {
+                        Vec::new()
+                    };
 
-            if !entries.is_empty() && verbose_raft() {
-                println!(
-                    "[S2-{}] replicate -> S2-{} next_index={} batch={} leader_last={}",
-                    self.self_id,
-                    peer.id,
-                    next_idx,
-                    entries.len(),
-                    leader_last
-                );
-            }
+                    if !entries.is_empty() && verbose_raft() {
+                        println!(
+                            "[S2-{}] replicate -> S2-{} next_index={} batch={} leader_last={}",
+                            self.self_id,
+                            peer.id,
+                            next_idx,
+                            entries.len(),
+                            leader_last
+                        );
+                    }
 
+                    (peer, prev_log_index, prev_log_term, entries)
+                })
+                .collect()
+        };
+
+        for (peer, prev_log_index, prev_log_term, entries) in outgoing {
             self.send(
                 peer,
                 &Message::AppendEntries {

@@ -19,6 +19,11 @@ use std::collections::HashSet;
 /// buffer at full window).
 const WINDOW: u64 = 1_048_576;
 const WORDS: usize = (WINDOW / 64) as usize;
+/// Bounds `overflow`'s memory when a gap outlives the ring-bitset window —
+/// see order-receiver/src/sequence_tracker.rs's copy of this constant for
+/// the full rationale (this implementation is intentionally duplicated,
+/// not shared, per this repo's per-crate convention).
+const OVERFLOW_CAP: usize = WINDOW as usize;
 
 pub struct SequenceTracker {
     /// Highest order_id such that every order_id in [1, last_contiguous] has
@@ -68,8 +73,16 @@ impl SequenceTracker {
             let was_set = self.bits[word] & bit != 0;
             self.bits[word] |= bit;
             !was_set
+        } else if self.overflow.len() < OVERFLOW_CAP {
+            let was_new = self.overflow.insert(order_id);
+            if was_new && self.overflow.len() == OVERFLOW_CAP {
+                eprintln!(
+                    "[sequence_tracker] overflow set reached its {OVERFLOW_CAP}-entry cap — a gap has outlived the {WINDOW}-id tracking window; further far-ahead ids will be treated as new without exact dedup until the gap closes"
+                );
+            }
+            was_new
         } else {
-            self.overflow.insert(order_id)
+            true
         };
 
         // Advance the watermark while the next slot is already set,

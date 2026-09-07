@@ -182,30 +182,38 @@ fn main() {
                     );
                     return;
                 };
-                if let Ok(result) = bincode::deserialize::<ResultWire>(payload) {
-                    // Dedup + gap tracking across the whole process lifetime
-                    // (not just an in-memory HashSet that forgets on
-                    // restart) — replays and leader-failover redeliveries
-                    // are recognized and skipped here.
-                    if !tracker.lock().unwrap().mark(result.order_id) {
+                let result = match bincode::deserialize::<ResultWire>(payload) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        eprintln!(
+                            "[order-receiver] dropped result packet ({} bytes): bincode deserialize failed: {e} — check ResultWire/ReplicatedCommand field sync with order-process",
+                            payload.len()
+                        );
                         return;
                     }
-                    let received_ts_ms = now_ms();
-                    let line = format!(
-                        "{} {} {} {} {} {} {} {} {}",
-                        result.order_id, result.symbol, result.side, result.qty,
-                        result.status, result.filled_qty, result.processed_by,
-                        result.term, received_ts_ms,
-                    );
-                    // Blocking, not try_send: mark() above already recorded this
-                    // order_id as seen, so a dropped send here would be permanently
-                    // invisible to gap detection/replay — same invariant as
-                    // order-process's poll_tx.send() (see its main.rs for the full
-                    // rationale). Backpressure here naturally throttles Aeron
-                    // fragment consumption instead of silently losing the order.
-                    let _ = log_tx.send(line);
-                    received_total.fetch_add(1, Ordering::Relaxed);
+                };
+                // Dedup + gap tracking across the whole process lifetime
+                // (not just an in-memory HashSet that forgets on
+                // restart) — replays and leader-failover redeliveries
+                // are recognized and skipped here.
+                if !tracker.lock().unwrap().mark(result.order_id) {
+                    return;
                 }
+                let received_ts_ms = now_ms();
+                let line = format!(
+                    "{} {} {} {} {} {} {} {} {}",
+                    result.order_id, result.symbol, result.side, result.qty,
+                    result.status, result.filled_qty, result.processed_by,
+                    result.term, received_ts_ms,
+                );
+                // Blocking, not try_send: mark() above already recorded this
+                // order_id as seen, so a dropped send here would be permanently
+                // invisible to gap detection/replay — same invariant as
+                // order-process's poll_tx.send() (see its main.rs for the full
+                // rationale). Backpressure here naturally throttles Aeron
+                // fragment consumption instead of silently losing the order.
+                let _ = log_tx.send(line);
+                received_total.fetch_add(1, Ordering::Relaxed);
             }, 256)
             .unwrap_or(0);
 

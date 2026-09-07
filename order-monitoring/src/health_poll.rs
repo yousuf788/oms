@@ -9,6 +9,7 @@
 // corroboration decision — order-monitoring stays a non-sequencing arbiter;
 // this is display-only.
 
+use crate::auth;
 use crate::config::config;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -78,7 +79,8 @@ fn probe_once(socket: &UdpSocket, host: &str, port: u16, timeout: Duration) -> O
     let nonce: u64 = rand::random();
     let ping = HealthMsg::Ping { nonce };
     let payload = serde_json::to_vec(&ping).ok()?;
-    socket.send_to(&payload, (host, port)).ok()?;
+    let frame = auth::sign(&payload);
+    socket.send_to(&frame, (host, port)).ok()?;
     let deadline = Instant::now() + timeout;
     let mut buf = [0u8; 256];
     loop {
@@ -89,8 +91,11 @@ fn probe_once(socket: &UdpSocket, host: &str, port: u16, timeout: Duration) -> O
         let _ = socket.set_read_timeout(Some(remaining));
         match socket.recv_from(&mut buf) {
             Ok((n, _src)) => {
+                let Some(payload) = auth::verify(&buf[..n]) else {
+                    continue; // unsigned/forged pong — keep waiting until the deadline
+                };
                 if let Ok(HealthMsg::Pong { nonce: got, role, term, .. }) =
-                    serde_json::from_slice(&buf[..n])
+                    serde_json::from_slice(payload)
                 {
                     if got == nonce {
                         return Some((role, term));

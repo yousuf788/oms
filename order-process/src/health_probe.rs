@@ -52,7 +52,10 @@ pub fn start_health_responder(
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            if let Ok(HealthMsg::Ping { nonce }) = serde_json::from_slice(&buf[..n]) {
+            let Some(payload) = crate::auth::verify_monitoring(&buf[..n]) else {
+                continue; // unsigned/forged probe — never trust reachability to an attacker
+            };
+            if let Ok(HealthMsg::Ping { nonce }) = serde_json::from_slice(payload) {
                 let pong = HealthMsg::Pong {
                     node_id: self_id,
                     nonce,
@@ -60,7 +63,8 @@ pub fn start_health_responder(
                     term: term.load(Ordering::Relaxed),
                 };
                 if let Ok(bytes) = serde_json::to_vec(&pong) {
-                    let _ = socket.send_to(&bytes, src);
+                    let frame = crate::auth::sign_monitoring(&bytes);
+                    let _ = socket.send_to(&frame, src);
                 }
             }
         }

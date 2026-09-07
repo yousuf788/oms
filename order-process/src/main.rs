@@ -302,7 +302,15 @@ fn process_orders_batch_as_leader(
     let commands: Vec<ReplicatedCommand> = orders
         .iter()
         .map(|order| {
-            let status = outcomes[rng.gen_range(0..outcomes.len())];
+            // qty == 0 can't be filled or partially filled — force REJECTED
+            // rather than calling gen_range(1..=0), which panics on an empty
+            // range and would crash the leader (and, via replay, every node
+            // that subsequently becomes leader for this order_id).
+            let status = if order.qty == 0 {
+                "REJECTED"
+            } else {
+                outcomes[rng.gen_range(0..outcomes.len())]
+            };
             let filled_qty: u32 = if status == "REJECTED" {
                 0
             } else {

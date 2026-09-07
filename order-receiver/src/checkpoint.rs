@@ -42,6 +42,11 @@ fn save(last_contiguous: u64) {
     }
     if let Ok(mut f) = fs::File::create(&p) {
         let _ = write!(f, "{last_contiguous}");
+        // Without this, the watermark can sit in the OS page cache and be
+        // lost on an unclean host crash (not just a process crash) —
+        // sync_data() is enough since we don't depend on the file's
+        // metadata, only its content.
+        let _ = f.sync_data();
     }
 }
 

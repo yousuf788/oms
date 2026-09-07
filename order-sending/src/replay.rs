@@ -55,6 +55,16 @@ pub fn start_replay_listener(
                 Err(_) => continue,
             };
 
+            if n == buf.len() {
+                // recv_from silently truncates a datagram larger than the
+                // buffer — a truncated payload will fail HMAC verification
+                // below, but without this it just looks like tampering.
+                eprintln!(
+                    "[order-sending] replay request from {src} filled the {}-byte recv buffer — likely truncated",
+                    buf.len()
+                );
+            }
+
             let payload = match auth::verify(&buf[..n]) {
                 Some(p) => p,
                 None => {
@@ -65,8 +75,15 @@ pub fn start_replay_listener(
             let Ok(req) = bincode::deserialize::<ReplayRequest>(payload) else {
                 continue;
             };
-            let Some(node_tx) = node_channels.get((req.requester_id.saturating_sub(1)) as usize)
-            else {
+            // requester_id is 1-based (NODE1/2/3); reject 0 explicitly rather
+            // than letting saturating_sub silently fold it into node 1's slot.
+            let Some(node_idx) = req.requester_id.checked_sub(1) else {
+                eprintln!(
+                    "[order-sending] replay request with invalid requester_id=0 from {src}"
+                );
+                continue;
+            };
+            let Some(node_tx) = node_channels.get(node_idx as usize) else {
                 eprintln!(
                     "[order-sending] replay request from unknown requester_id={}",
                     req.requester_id
@@ -74,14 +91,21 @@ pub fn start_replay_listener(
                 continue;
             };
 
+            // Read and serialize the requested frames while holding the WAL
+            // lock (fast: in-memory/disk only), then release it before doing
+            // any channel I/O — node_tx.send() is a blocking send into the
+            // same per-node channel the live fan-out thread publishes into,
+            // and holding the WAL mutex across it would stall the WAL-writer
+            // thread (and transitively, live order delivery to every node)
+            // behind whichever node this replay burst is slow to drain into.
             let range_count = req.ranges.len();
-            let mut served = 0u64;
-            {
+            let frames: Vec<Arc<Vec<u8>>> = {
                 let wal = wal.lock().unwrap();
+                let mut frames = Vec::new();
                 'ranges: for (from, to) in req.ranges {
                     let to = to.min(wal.last_order_id());
                     for order_id in from..=to {
-                        if served >= MAX_ORDERS_PER_REQUEST {
+                        if frames.len() as u64 >= MAX_ORDERS_PER_REQUEST {
                             break 'ranges;
                         }
                         let Some(order): Option<OrderWire> = wal.get(order_id) else {
@@ -90,13 +114,18 @@ pub fn start_replay_listener(
                         let Ok(encoded) = bincode::serialize(&order) else {
                             continue;
                         };
-                        let frame = Arc::new(auth::sign(&encoded));
-                        if node_tx.send(frame).is_err() {
-                            break 'ranges; // that node's publisher thread exited
-                        }
-                        served += 1;
+                        frames.push(Arc::new(auth::sign(&encoded)));
                     }
                 }
+                frames
+            };
+
+            let mut served = 0u64;
+            for frame in frames {
+                if node_tx.send(frame).is_err() {
+                    break; // that node's publisher thread exited
+                }
+                served += 1;
             }
 
             if served > 0 {
