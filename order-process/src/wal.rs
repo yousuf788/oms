@@ -170,14 +170,28 @@ impl Wal {
         self.entries.last().map(|entry| entry.term).unwrap_or(0)
     }
 
-    /// Highest `order_id` among all entries currently in this WAL — NOT the
-    /// same as `last_index()` (that's the Raft log position; this is the
-    /// business identity). Used to seed the ingest-side `SequenceTracker`'s
-    /// watermark and fire a startup catch-up `REPLAY_REQUEST` to
-    /// order-sending on restart, so this node proactively recovers whatever
-    /// it missed instead of waiting for a new live order to reveal the gap.
-    pub fn max_order_id(&self) -> u64 {
-        self.entries.iter().map(|e| e.command.order_id).max().unwrap_or(0)
+    /// Highest `order_id` among entries with Raft `index <= index_limit` —
+    /// NOT the same as `last_index()` (that's the Raft log position; this is
+    /// the business identity). Used to seed the ingest-side
+    /// `SequenceTracker`'s watermark and fire a startup catch-up
+    /// `REPLAY_REQUEST` to order-sending on restart, so this node
+    /// proactively recovers whatever it missed instead of waiting for a new
+    /// live order to reveal the gap.
+    ///
+    /// Bounded by `index_limit` (the last known-committed Raft index — see
+    /// `commit_checkpoint.rs`) rather than scanning every entry on disk,
+    /// because this WAL can hold an uncommitted leader tail at crash time
+    /// (`propose_batch` doesn't wait for quorum before returning). Seeding
+    /// the watermark from unbounded `entries` would let the tracker believe
+    /// it had "seen" order_ids that a legitimate new leader later truncates
+    /// via `truncate_from` — after which they'd never be re-requested.
+    pub fn max_order_id_up_to(&self, index_limit: u64) -> u64 {
+        self.entries
+            .iter()
+            .take_while(|e| e.index <= index_limit)
+            .map(|e| e.command.order_id)
+            .max()
+            .unwrap_or(0)
     }
 
     pub fn get_term_at(&self, index: u64) -> Option<u64> {

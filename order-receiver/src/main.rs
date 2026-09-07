@@ -17,7 +17,7 @@ use std::ffi::CString;
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -112,8 +112,17 @@ fn main() {
 
     println!("[order-receiver] === STEP 4: Starting Log Writer & Throughput Monitor ===");
     let (log_tx, log_rx) = mpsc::sync_channel::<String>(1_000_000);
+    // Set by the SIGINT/SIGTERM handler below; the writer thread notices it
+    // on its next idle tick (at most 50ms later), drains whatever's still
+    // queued, flushes, and signals back via shutdown_done_tx before the
+    // process actually exits — otherwise up to that 50ms window of
+    // already-deduped results could be lost on a kill, silently (they'd
+    // never be re-delivered: mark() already recorded them as seen).
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (shutdown_done_tx, shutdown_done_rx) = mpsc::channel::<()>();
     {
         let path = received_log_path();
+        let shutdown = Arc::clone(&shutdown);
         thread::spawn(move || {
             if let Some(parent) = path.parent() { let _ = create_dir_all(parent); }
             let mut file = OpenOptions::new().create(true).append(true).open(&path)
@@ -129,16 +138,44 @@ fn main() {
                             buf.clear();
                         }
                     }
-                    Err(_) => {
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
                         if !buf.is_empty() {
                             let _ = file.write_all(buf.as_bytes());
                             let _ = file.flush();
                             buf.clear();
                         }
+                        if shutdown.load(Ordering::SeqCst) {
+                            while let Ok(line) = log_rx.try_recv() {
+                                buf.push_str(&line);
+                                buf.push('\n');
+                            }
+                            if !buf.is_empty() {
+                                let _ = file.write_all(buf.as_bytes());
+                                let _ = file.flush();
+                            }
+                            let _ = shutdown_done_tx.send(());
+                            break;
+                        }
                     }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
         });
+    }
+    {
+        let shutdown = Arc::clone(&shutdown);
+        ctrlc::set_handler(move || {
+            if shutdown.swap(true, Ordering::SeqCst) {
+                return; // already shutting down — ignore a second signal
+            }
+            eprintln!("[order-receiver] shutdown signal received, flushing pending results...");
+            // Bounded wait, not indefinite: the writer's own idle tick is
+            // 50ms, so this is ample headroom without risking a hang if
+            // something is stuck.
+            let _ = shutdown_done_rx.recv_timeout(Duration::from_secs(2));
+            std::process::exit(0);
+        })
+        .expect("failed to set SIGINT/SIGTERM handler");
     }
 
     let received_total = Arc::new(AtomicU64::new(0));

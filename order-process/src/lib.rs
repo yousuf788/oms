@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod commit_checkpoint;
 pub mod config;
 pub mod health_probe;
 pub mod leader_election;

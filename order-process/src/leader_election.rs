@@ -208,6 +208,15 @@ impl LeaderElection {
         let bind_host = crate::config::config().bind_host.as_str();
         let socket = bind_tuned_udp_socket(bind_host, self_node.raft_port);
         let wal = Wal::new(self_id).expect("failed to open replicated WAL");
+        // Seed commit_index from the last persisted checkpoint (clamped to
+        // what's actually in this WAL) instead of always starting at 0 — see
+        // commit_checkpoint.rs for why an unbounded max_order_id() at
+        // startup is unsafe. last_applied stays 0; apply_committed_entries()
+        // fast-forwards it to commit_index on the first tick, and
+        // result_publisher_loop never republishes historical entries since
+        // it only publishes while leader and fast-forwards last_published to
+        // last_applied whenever it isn't.
+        let initial_commit_index = crate::commit_checkpoint::load(self_id, wal.last_index());
 
         // Build the IP allowlist from configured peer host strings.
         // This is resolved once at startup; dynamic DNS changes require a restart.
@@ -232,7 +241,7 @@ impl LeaderElection {
                 votes: HashSet::new(),
                 next_index: HashMap::new(),
                 match_index: HashMap::new(),
-                commit_index: 0,
+                commit_index: initial_commit_index,
                 last_applied: 0,
                 last_heartbeat: Instant::now(),
                 election_timeout: random_timeout(),
@@ -278,7 +287,25 @@ impl LeaderElection {
         let publish_handle = Arc::clone(&election);
         thread::spawn(move || publish_handle.result_publisher_loop(result_pub, replay_rx));
 
+        let checkpoint_handle = Arc::clone(&election);
+        thread::spawn(move || checkpoint_handle.commit_checkpoint_loop());
+
         election
+    }
+
+    /// Persists `commit_index` on a bounded interval — see
+    /// commit_checkpoint.rs for why. Writes only when it changed since the
+    /// last tick, and the disk write happens outside the state lock.
+    fn commit_checkpoint_loop(&self) {
+        let mut last_written = 0u64;
+        loop {
+            thread::sleep(Duration::from_millis(crate::commit_checkpoint::CHECKPOINT_INTERVAL_MS));
+            let current = { self.state.lock().unwrap().commit_index };
+            if current != last_written {
+                crate::commit_checkpoint::save(self.self_id, current);
+                last_written = current;
+            }
+        }
     }
 
     /// Watches `last_applied` and streams each newly-committed entry's result
@@ -408,8 +435,14 @@ impl LeaderElection {
     /// fire a catch-up `REPLAY_REQUEST` to order-sending (see main.rs and
     /// replay_client.rs), regardless of Raft role (a follower's WAL is just
     /// as valid a source of "what have I already got" as a leader's).
+    ///
+    /// Bounded by `commit_index`, not every entry on disk — see
+    /// commit_checkpoint.rs and `Wal::max_order_id_up_to` for why an
+    /// unbounded scan is unsafe (an uncommitted leader tail at crash time
+    /// can later be truncated by a legitimate new leader).
     pub fn max_committed_order_id(&self) -> u64 {
-        self.wal.lock().unwrap().max_order_id()
+        let commit_index = self.state.lock().unwrap().commit_index;
+        self.wal.lock().unwrap().max_order_id_up_to(commit_index)
     }
 
     /// Role line including "not available" for silent peers.
