@@ -144,20 +144,24 @@ fn main() {
                             let _ = file.flush();
                             buf.clear();
                         }
-                        if shutdown.load(Ordering::SeqCst) {
-                            while let Ok(line) = log_rx.try_recv() {
-                                buf.push_str(&line);
-                                buf.push('\n');
-                            }
-                            if !buf.is_empty() {
-                                let _ = file.write_all(buf.as_bytes());
-                                let _ = file.flush();
-                            }
-                            let _ = shutdown_done_tx.send(());
-                            break;
-                        }
                     }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                // Checked after every recv — not only on an idle timeout,
+                // since under continuous live traffic the channel may never
+                // go quiet and the Timeout branch above may never fire, which
+                // would delay noticing shutdown indefinitely.
+                if shutdown.load(Ordering::SeqCst) {
+                    while let Ok(line) = log_rx.try_recv() {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                    if !buf.is_empty() {
+                        let _ = file.write_all(buf.as_bytes());
+                        let _ = file.flush();
+                    }
+                    let _ = shutdown_done_tx.send(());
+                    break;
                 }
             }
         });
