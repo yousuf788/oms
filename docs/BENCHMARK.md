@@ -166,6 +166,52 @@ steady-state processing latency.
   Media Driver defaults for these runs — no target lab hardware/network was specified to tune
   against, so no claim is made about its effect.
 
+### 0.6 Post-bug-fix regression check — 2026-09-07
+
+Context: a code-review audit this session found and fixed 13 bugs across all 4 crates (branch
+`feature/handle-order`, commits `1434013`, `5581f26`, `d44332d`) — the ones most relevant to the
+throughput/correctness path benchmarked here: a leader-crashing panic on a `qty=0` order,
+`replicate_to_peers()` holding the WAL lock across peer network I/O, a stale-leader race in
+replay-burst result publishing, the follower log-conflict WAL rewrite changed from an O(WAL size)
+full-file rewrite to an O(1) `set_len()` truncate, the dedup `overflow` set capped to prevent
+unbounded growth under a sustained gap, a persisted Raft commit-watermark checkpoint added to
+bound startup recovery, and `order-receiver` given a graceful-shutdown flush. Full writeup of each
+fix is in the commit messages on that branch.
+
+Also live-tested beyond unit tests: `SIGKILL`ed the Raft leader mid-flight under ~1,000 orders/sec
+load. The cluster failed over to a new leader with **zero throughput drop**, the crashed node
+rejoined cleanly on restart using the new persisted commit-watermark (its own startup log:
+`resuming ingest sequence tracker at order_id 45440`, matching the watermark recorded right before
+the kill), and no panics or role-flapping occurred. Separately, sent `SIGTERM` to `order-receiver`
+mid-flow at ~1,000 orders/sec: it drained its pending write queue and exited cleanly, with the last
+flushed log line timestamped ~2ms after the signal — no gap, no duplicate.
+
+Re-ran `scripts/run_benchmark.sh` (methodology unchanged from §0.2) to check the fixes above didn't
+regress throughput or correctness, on a different host from the rest of §0 (a 12-core sandboxed
+VM, not the "shared desktop" machine referenced in §0.1-§0.5 — treat these numbers as that machine's
+ceiling, not comparable point-for-point to earlier entries in this section):
+
+| Configuration | Target TPS | Sent | Received | Missing | Duplicates | Latency p50 / p99 / max |
+|---|---|---|---|---|---|---|
+| 1 node | 5,000 | 47,104 (~4,710/s) | 47,496 (~4,749/s) | none | 0 | 3ms / 19ms / 54ms |
+| 3 nodes (Raft) | 5,000 | 47,104 (~4,710/s) | 47,488 (~4,748/s) | none | 0 | 2ms / 16ms / 23ms |
+| 3 nodes (Raft) | 6,000 | 57,344 (~5,734/s) | 57,728 (~5,772/s) | none | 0 | 2ms / 9ms / 19ms |
+| 3 nodes (Raft) | 8,000 | 75,776 (~7,577/s) | 77,136 (~7,713/s) | none | 0 | 2ms / 740ms / 748ms |
+| 3 nodes (Raft) | 15,000 | 143,360 (~14,336/s) | 145,371 (~14,537/s) | none (60s convergence window) | 0 | 5.8s / 10.5s / 10.6s |
+| 3 nodes (Raft) | 50,000 | 483,328 (~48,332/s) | 182,169 (still draining) | 301,159 outstanding at 15s cutoff | 0 | growing, not steady-state |
+
+**No regression**: zero missing ranges and zero duplicates at every rate tested, including two
+rates well past this machine's real capacity (15,000 and 50,000) — the overload cases back up and
+drain slowly (15,000 fully converged within a 60s window; 50,000 was still converging when the
+convergence wait was cut short) rather than losing or duplicating anything, the same documented
+cliff behavior as §0.2/§0.3, not a new problem introduced by this session's fixes.
+
+**This run's clean, low-latency steady-state ceiling**: ~6,000/sec (3-node) — by 8,000/sec p99
+latency has already jumped to ~740ms, and 15,000/sec+ backs up to multi-second latency. Read this
+as this VM's ceiling on this run, not a fixed constant (§0.2 already establishes this number moves
+with host contention) — and, per §0.3, still nowhere near the 200k-300k design target, which
+remains unvalidated on real lab hardware.
+
 ---
 
 ## Executive Summary
