@@ -1,3 +1,10 @@
+pub mod auth;
+pub mod commit_checkpoint;
 pub mod config;
+pub mod health_probe;
 pub mod leader_election;
+pub mod monitoring_client;
+pub mod replay_client;
+pub mod replay_server;
+pub mod sequence_tracker;
 pub mod wal;

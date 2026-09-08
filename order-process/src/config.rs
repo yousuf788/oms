@@ -8,6 +8,14 @@ pub struct S2Node {
     pub host: String,
     pub raft_port: u16,
     pub order_port: u16,
+    /// Trivial liveness-probe port, used only by the monitoring service — completely
+    /// separate from `raft_port` so monitoring probes never touch Raft consensus state.
+    pub health_port: u16,
+    /// Dedicated port for the S2->S3 replay-request control channel — a peer
+    /// (order-receiver) asks this node to re-publish committed results in a
+    /// range. Separate from `raft_port`/`order_port`/`health_port` for the
+    /// same reason those are separate from each other.
+    pub replay_port: u16,
 }
 
 #[derive(Clone, Debug)]
@@ -23,6 +31,21 @@ pub struct ClusterConfig {
     /// When peers are silent, allow this node to win with only its own vote (lab failover).
     pub allow_single_node_leader: bool,
     pub peer_silent_ms: u64,
+    /// Address of the independent monitoring service consulted before a lone node is
+    /// allowed to self-promote. `None` if `monitoring_HOST` isn't set.
+    pub monitoring_host: Option<String>,
+    pub monitoring_port: u16,
+    pub monitoring_timeout_ms: u64,
+    pub monitoring_retry_interval_ms: u64,
+    /// If true (default), a monitoring must corroborate before single-node self-promotion
+    /// is allowed — no monitoring reachable means no promotion. If false, falls back to
+    /// the legacy blind-timeout behavior (local demo only).
+    pub require_monitoring_for_single_node_leader: bool,
+    /// order-sending's replay listener address — where this node sends
+    /// REPLAY_REQUEST when its ingest sequence tracker detects a persistent
+    /// gap in incoming orders.
+    pub s1_host: String,
+    pub s1_replay_port: u16,
 }
 
 static CONFIG: OnceLock<ClusterConfig> = OnceLock::new();
@@ -58,6 +81,33 @@ fn env_bool(key: &str, default: bool) -> bool {
     }
 }
 
+/// Optional Aeron channel-URI tuning params (`term-length`, `mtu`,
+/// `so-sndbuf`, `so-rcvbuf`), appended to every publication/subscription URI
+/// this crate builds. All four are unset by default, which preserves
+/// today's behavior (Media Driver defaults) — every publication/subscription
+/// in this codebase previously used a bare `aeron:udp?endpoint=...` URI with
+/// no transport tuning at all. Set the env vars to opt in; `so-sndbuf`/
+/// `so-rcvbuf` must not exceed this host's OS socket buffer limits
+/// (`net.core.rmem_max`/`wmem_max` on Linux) or Aeron will fail to create
+/// the publication/subscription — raise those sysctls first if increasing
+/// these. `term-length` must be a power of two, minimum 64KB.
+pub fn aeron_channel_tuning() -> String {
+    let mut params = String::new();
+    if let Ok(v) = env::var("AERON_TERM_LENGTH") {
+        params.push_str(&format!("|term-length={v}"));
+    }
+    if let Ok(v) = env::var("AERON_MTU") {
+        params.push_str(&format!("|mtu={v}"));
+    }
+    if let Ok(v) = env::var("AERON_SO_SNDBUF") {
+        params.push_str(&format!("|so-sndbuf={v}"));
+    }
+    if let Ok(v) = env::var("AERON_SO_RCVBUF") {
+        params.push_str(&format!("|so-rcvbuf={v}"));
+    }
+    params
+}
+
 fn load_from_env() -> ClusterConfig {
     let _ = dotenvy::dotenv();
 
@@ -65,10 +115,12 @@ fn load_from_env() -> ClusterConfig {
         nodes: vec![
             S2Node {
                 id: 1,
-                name: env_or("NODE1_NAME", "Vivek"),
+                name: env_or("NODE1_NAME", "Nitin"),
                 host: env_required("NODE1_HOST"),
                 raft_port: env_u16("NODE1_RAFT_PORT", 6001),
                 order_port: env_u16("NODE1_ORDER_PORT", 7001),
+                health_port: env_u16("NODE1_HEALTH_PORT", 6101),
+                replay_port: env_u16("NODE1_REPLAY_PORT", 6201),
             },
             S2Node {
                 id: 2,
@@ -76,6 +128,8 @@ fn load_from_env() -> ClusterConfig {
                 host: env_required("NODE2_HOST"),
                 raft_port: env_u16("NODE2_RAFT_PORT", 6002),
                 order_port: env_u16("NODE2_ORDER_PORT", 7002),
+                health_port: env_u16("NODE2_HEALTH_PORT", 6102),
+                replay_port: env_u16("NODE2_REPLAY_PORT", 6202),
             },
             S2Node {
                 id: 3,
@@ -83,17 +137,29 @@ fn load_from_env() -> ClusterConfig {
                 host: env_required("NODE3_HOST"),
                 raft_port: env_u16("NODE3_RAFT_PORT", 6003),
                 order_port: env_u16("NODE3_ORDER_PORT", 7003),
+                health_port: env_u16("NODE3_HEALTH_PORT", 6103),
+                replay_port: env_u16("NODE3_REPLAY_PORT", 6203),
             },
         ],
-        bind_host: env_or("BIND_HOST", "0.0.0.0"),
+        bind_host: env_required("BIND_HOST"),
         s3_host: env_required("S3_HOST"),
         s3_port: env_u16("S3_PORT", 8001),
-        heartbeat_interval_ms: env_u64("HEARTBEAT_INTERVAL_MS", 100),
-        election_timeout_min_ms: env_u64("ELECTION_TIMEOUT_MIN_MS", 300),
-        election_timeout_max_ms: env_u64("ELECTION_TIMEOUT_MAX_MS", 600),
+        heartbeat_interval_ms: env_u64("HEARTBEAT_INTERVAL_MS", 50),
+        election_timeout_min_ms: env_u64("ELECTION_TIMEOUT_MIN_MS", 150),
+        election_timeout_max_ms: env_u64("ELECTION_TIMEOUT_MAX_MS", 300),
         verbose_raft: env_bool("VERBOSE_RAFT", false),
         allow_single_node_leader: env_bool("ALLOW_SINGLE_NODE_LEADER", true),
         peer_silent_ms: env_u64("PEER_SILENT_MS", 2000),
+        monitoring_host: env::var("monitoring_HOST").ok(),
+        monitoring_port: env_u16("monitoring_PORT", 9101),
+        monitoring_timeout_ms: env_u64("monitoring_TIMEOUT_MS", 1500),
+        monitoring_retry_interval_ms: env_u64("monitoring_RETRY_INTERVAL_MS", 2000),
+        require_monitoring_for_single_node_leader: env_bool(
+            "REQUIRE_monitoring_FOR_SINGLE_NODE_LEADER",
+            true,
+        ),
+        s1_host: env_required("S1_HOST"),
+        s1_replay_port: env_u16("S1_REPLAY_PORT", 9001),
     }
 }
 
@@ -114,10 +180,10 @@ fn local_ipv4_addrs() -> Vec<String> {
             }
         }
     }
-    // Loopback for single-machine .env.example demos
-    if ips.is_empty() {
-        ips.push("127.0.0.1".to_string());
-    } else if !ips.iter().any(|ip| ip == "127.0.0.1") {
+    // Loopback for single-machine .env.example demos — covers both the
+    // empty case and "present but missing 127.0.0.1" in one check, since
+    // `any()` on an empty iterator is already `false`.
+    if !ips.iter().any(|ip| ip == "127.0.0.1") {
         ips.push("127.0.0.1".to_string());
     }
     ips
@@ -165,7 +231,7 @@ pub fn node_name(id: u8) -> String {
         .unwrap_or_else(|| format!("S2-{id}"))
 }
 
-/// e.g. "Vivek is not available; Amit is not available; Yousuf is LEADER"
+/// e.g. "Nitin is not available; Amit is not available; Yousuf is LEADER"
 pub fn format_role_summary(leader_id: Option<u8>, unavailable: &[u8]) -> String {
     config()
         .nodes
@@ -210,4 +276,36 @@ pub fn election_timeout_min_ms() -> u64 {
 
 pub fn election_timeout_max_ms() -> u64 {
     config().election_timeout_max_ms
+}
+
+pub fn monitoring_host() -> Option<String> {
+    config().monitoring_host.clone()
+}
+
+pub fn monitoring_port() -> u16 {
+    config().monitoring_port
+}
+
+pub fn monitoring_timeout_ms() -> u64 {
+    config().monitoring_timeout_ms
+}
+
+pub fn monitoring_retry_interval_ms() -> u64 {
+    config().monitoring_retry_interval_ms
+}
+
+pub fn require_monitoring_for_single_node_leader() -> bool {
+    config().require_monitoring_for_single_node_leader
+}
+
+pub fn health_port(id: u8) -> Option<u16> {
+    find_node(id).map(|n| n.health_port)
+}
+
+pub fn s1_host() -> String {
+    config().s1_host.clone()
+}
+
+pub fn s1_replay_port() -> u16 {
+    config().s1_replay_port
 }

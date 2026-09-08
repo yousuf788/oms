@@ -1,30 +1,48 @@
-// order-receiver (S3)
-// Bind host/port from `.env` (BIND_HOST, S3_PORT).
-// Appends each received result to logs/orders-received.log
+// order-receiver (S3) — Aeron subscriber
+// Subscribes to the result channel that the S2 leader publishes to.
+// Deduplicates by order_id (handles leader failover duplicates).
 
+mod auth;
+mod checkpoint;
 mod config;
+mod replay_client;
+mod sequence_tracker;
 
 use config::init_config;
-use serde_json::Value;
+use replay_client::start_replay_client;
+use rusteron_client::*;
+use sequence_tracker::SequenceTracker;
+use serde::Deserialize;
+use std::ffi::CString;
 use std::fs::{create_dir_all, OpenOptions};
 use std::io::Write;
-use std::net::UdpSocket;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+const RESULT_STREAM_ID: i32 = 2001;
+
+/// Wire format for a committed result from order-process's Aeron result
+/// channel. KEEP IN SYNC WITH order-process/src/wal.rs::ReplicatedCommand —
+/// order-process serializes that struct directly as the wire payload, and
+/// bincode decodes positionally (by declaration order and type, not by
+/// field name), so the field order/types here must match it exactly.
+#[derive(Deserialize, Debug, Clone)]
+struct ResultWire {
+    order_id: u64,
+    symbol: String,
+    side: String,
+    qty: u32,
+    status: String,
+    filled_qty: u32,
+    processed_by: String,
+    term: u64,
+}
 
 fn received_log_path() -> PathBuf {
     PathBuf::from("logs").join("orders-received.log")
-}
-
-fn append_received_log(line: &str) {
-    let path = received_log_path();
-    if let Some(parent) = path.parent() {
-        let _ = create_dir_all(parent);
-    }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(file, "{line}");
-        let _ = file.flush();
-    }
 }
 
 fn now_ms() -> u128 {
@@ -34,35 +52,212 @@ fn now_ms() -> u128 {
         .unwrap_or(0)
 }
 
-fn main() {
-    let cfg = init_config();
-    let socket = UdpSocket::bind((cfg.bind_host.as_str(), cfg.bind_port))
-        .expect("failed to bind receiver socket");
-    println!(
-        "[order-receiver] listening on {}:{}, writing to {}",
-        cfg.bind_host,
-        cfg.bind_port,
-        received_log_path().display()
-    );
-
-    let mut buf = [0u8; 4096];
-    loop {
-        let (n, src) = match socket.recv_from(&mut buf) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        if let Ok(mut result) = serde_json::from_slice::<Value>(&buf[..n]) {
-            if let Some(obj) = result.as_object_mut() {
-                obj.insert("from".to_string(), Value::String(src.to_string()));
-                obj.insert("received_ts_ms".to_string(), json_u128(now_ms()));
+fn aeron_dir() -> String {
+    std::env::var("AERON_DIR")
+        .unwrap_or_else(|_| {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                extern "C" { fn getuid() -> u32; }
+                format!("/dev/shm/aeron-{}", getuid())
             }
-            let line = result.to_string();
-            append_received_log(&line);
-            println!("[order-receiver] received -> {}", line);
-        }
-    }
+            #[cfg(not(target_os = "linux"))]
+            "/dev/shm/aeron-0".to_string()
+        })
 }
 
-fn json_u128(v: u128) -> Value {
-    Value::Number(serde_json::Number::from(v as u64))
+fn main() {
+    println!("[order-receiver] === STEP 1: Loading Receiver Configuration ===");
+    let cfg = init_config();
+    println!(
+        "[order-receiver] Config initialized — Bind Host: {}, S3 Port: {}",
+        cfg.bind_host, cfg.bind_port
+    );
+
+    println!("[order-receiver] === STEP 2: Connecting to Aeron Media Driver ===");
+    let aeron_dir_path = aeron_dir();
+    println!("[order-receiver] connecting to Aeron Media Driver at {aeron_dir_path}");
+
+    let ctx = AeronContext::new().expect("Aeron context");
+    let aeron_dir_cstr = CString::new(aeron_dir_path).unwrap();
+    ctx.set_dir(&aeron_dir_cstr).expect("set aeron dir");
+    ctx.set_error_handler(Some(|code: i32, msg: &str| {
+        eprintln!("[aeron] error {code}: {msg}");
+    })).expect("set error handler");
+
+    let aeron = Aeron::new(&ctx).expect("Aeron client");
+    aeron.start().expect("start aeron client");
+    println!("[order-receiver] Aeron client successfully connected to media driver");
+
+    println!("[order-receiver] === STEP 3: Subscribing to Aeron Result Channel ===");
+    let channel = format!(
+        "aeron:udp?endpoint={}:{}{}",
+        cfg.bind_host, cfg.bind_port, config::aeron_channel_tuning()
+    );
+    println!(
+        "[order-receiver] subscribing on {channel} stream {RESULT_STREAM_ID}, writing to {}",
+        received_log_path().display()
+    );
+    let channel_cstr = CString::new(channel).unwrap();
+    let subscription = aeron
+        .async_add_subscription(
+            &channel_cstr,
+            RESULT_STREAM_ID,
+            Handlers::NONE,
+            Handlers::NONE,
+        )
+        .expect("async_add_subscription")
+        .poll_blocking(Duration::from_secs(10))
+        .expect("subscription ready");
+    println!("[order-receiver] result channel subscription ACTIVE on stream {RESULT_STREAM_ID}");
+
+    println!("[order-receiver] === STEP 4: Starting Log Writer & Throughput Monitor ===");
+    let (log_tx, log_rx) = mpsc::sync_channel::<String>(1_000_000);
+    // Set by the SIGINT/SIGTERM handler below; the writer thread notices it
+    // on its next idle tick (at most 50ms later), drains whatever's still
+    // queued, flushes, and signals back via shutdown_done_tx before the
+    // process actually exits — otherwise up to that 50ms window of
+    // already-deduped results could be lost on a kill, silently (they'd
+    // never be re-delivered: mark() already recorded them as seen).
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (shutdown_done_tx, shutdown_done_rx) = mpsc::channel::<()>();
+    {
+        let path = received_log_path();
+        let shutdown = Arc::clone(&shutdown);
+        thread::spawn(move || {
+            if let Some(parent) = path.parent() { let _ = create_dir_all(parent); }
+            let mut file = OpenOptions::new().create(true).append(true).open(&path)
+                .expect("cannot open orders-received.log");
+            let mut buf = String::with_capacity(128 * 1024);
+            loop {
+                match log_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(line) => {
+                        buf.push_str(&line); buf.push('\n');
+                        if buf.len() >= 65536 {
+                            let _ = file.write_all(buf.as_bytes());
+                            let _ = file.flush();
+                            buf.clear();
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if !buf.is_empty() {
+                            let _ = file.write_all(buf.as_bytes());
+                            let _ = file.flush();
+                            buf.clear();
+                        }
+                    }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                }
+                // Checked after every recv — not only on an idle timeout,
+                // since under continuous live traffic the channel may never
+                // go quiet and the Timeout branch above may never fire, which
+                // would delay noticing shutdown indefinitely.
+                if shutdown.load(Ordering::SeqCst) {
+                    while let Ok(line) = log_rx.try_recv() {
+                        buf.push_str(&line);
+                        buf.push('\n');
+                    }
+                    if !buf.is_empty() {
+                        let _ = file.write_all(buf.as_bytes());
+                        let _ = file.flush();
+                    }
+                    let _ = shutdown_done_tx.send(());
+                    break;
+                }
+            }
+        });
+    }
+    {
+        let shutdown = Arc::clone(&shutdown);
+        ctrlc::set_handler(move || {
+            if shutdown.swap(true, Ordering::SeqCst) {
+                return; // already shutting down — ignore a second signal
+            }
+            eprintln!("[order-receiver] shutdown signal received, flushing pending results...");
+            // Bounded wait, not indefinite: the writer's own idle tick is
+            // 50ms, so this is ample headroom without risking a hang if
+            // something is stuck.
+            let _ = shutdown_done_rx.recv_timeout(Duration::from_secs(2));
+            std::process::exit(0);
+        })
+        .expect("failed to set SIGINT/SIGTERM handler");
+    }
+
+    let received_total = Arc::new(AtomicU64::new(0));
+    {
+        let received_total = Arc::clone(&received_total);
+        thread::spawn(move || {
+            let mut last = 0u64;
+            loop {
+                thread::sleep(Duration::from_secs(1));
+                let now = received_total.load(Ordering::Relaxed);
+                println!("[order-receiver] throughput: {:>8} results/sec  total: {}", now - last, now);
+                last = now;
+            }
+        });
+    }
+
+    println!("[order-receiver] === STEP 4b: Loading Checkpoint & Starting Replay Client ===");
+    // Restores the dedup/gap watermark from the last checkpoint (0 if none)
+    // instead of assuming nothing has ever been seen, and immediately
+    // issues a catch-up REPLAY_REQUEST to the S2 cluster for anything since
+    // that checkpoint — see checkpoint.rs and replay_client.rs.
+    let start_watermark = checkpoint::load();
+    if start_watermark > 0 {
+        println!("[order-receiver] resuming from checkpoint: last_contiguous={start_watermark}");
+    }
+    let tracker = Arc::new(Mutex::new(SequenceTracker::with_watermark(start_watermark)));
+    checkpoint::start_checkpoint_writer(Arc::clone(&tracker));
+    start_replay_client(cfg.s2_nodes.clone(), Arc::clone(&tracker), start_watermark);
+
+    println!("[order-receiver] === STEP 5: Entering Poll Loop for Inbound Result Stream ===");
+    let mut idle = BackoffIdleStrategy::new();
+
+    println!("[order-receiver] ready, polling for results...");
+    loop {
+        let fragments = subscription
+            .poll_fn(|buf: &[u8], _hdr: AeronHeader| {
+                let Some(payload) = auth::verify(buf) else {
+                    eprintln!(
+                        "[order-receiver] dropped result packet ({} bytes): HMAC failure — check CLUSTER_HMAC_KEY in .env",
+                        buf.len()
+                    );
+                    return;
+                };
+                let result = match bincode::deserialize::<ResultWire>(payload) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        eprintln!(
+                            "[order-receiver] dropped result packet ({} bytes): bincode deserialize failed: {e} — check ResultWire/ReplicatedCommand field sync with order-process",
+                            payload.len()
+                        );
+                        return;
+                    }
+                };
+                // Dedup + gap tracking across the whole process lifetime
+                // (not just an in-memory HashSet that forgets on
+                // restart) — replays and leader-failover redeliveries
+                // are recognized and skipped here.
+                if !tracker.lock().unwrap().mark(result.order_id) {
+                    return;
+                }
+                let received_ts_ms = now_ms();
+                let line = format!(
+                    "{} {} {} {} {} {} {} {} {}",
+                    result.order_id, result.symbol, result.side, result.qty,
+                    result.status, result.filled_qty, result.processed_by,
+                    result.term, received_ts_ms,
+                );
+                // Blocking, not try_send: mark() above already recorded this
+                // order_id as seen, so a dropped send here would be permanently
+                // invisible to gap detection/replay — same invariant as
+                // order-process's poll_tx.send() (see its main.rs for the full
+                // rationale). Backpressure here naturally throttles Aeron
+                // fragment consumption instead of silently losing the order.
+                let _ = log_tx.send(line);
+                received_total.fetch_add(1, Ordering::Relaxed);
+            }, 256)
+            .unwrap_or(0);
+
+        idle.idle(fragments);
+    }
 }

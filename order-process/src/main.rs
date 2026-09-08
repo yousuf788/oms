@@ -1,27 +1,74 @@
-// order-process (S2 cluster replica)
-// Multi-machine: same .env everywhere; NODE_ID is auto-detected from local IP.
-// Override: NODE_ID=1|2|3 ./starter.sh   (needed for all-localhost demos)
+// order-process (S2 cluster replica) — Aeron transport
+// Subscribes to order channel via Aeron (replaces raw UDP recv).
+// Publishes committed results to S3 via Aeron (replaces raw UDP send).
+// All Raft consensus, WAL, and leader election logic is unchanged.
+//
+// Security: every inbound Aeron order message must carry a valid HMAC-SHA256
+// tag (written by order-sending). Raft control messages use the same key.
+// monitoring corroboration messages use a separate monitoring_HMAC_KEY.
+// Set CLUSTER_HMAC_KEY and monitoring_HMAC_KEY in .env (openssl rand -hex 32).
 
 use order_process::config::{find_node, init_config, node_name, resolve_node_id};
-use order_process::leader_election::LeaderElection;
+use order_process::auth;
+use order_process::health_probe::start_health_responder;
+use order_process::leader_election::{LeaderElection, Role};
+use order_process::replay_client::start_replay_client;
+use order_process::replay_server::start_replay_server;
+use order_process::sequence_tracker::SequenceTracker;
 use order_process::wal::ReplicatedCommand;
 use rand::Rng;
-use serde::Deserialize;
-use serde_json::json;
-use std::fs::{create_dir_all, OpenOptions};
-use std::io::Write;
-use std::net::UdpSocket;
-use std::path::PathBuf;
+use rusteron_client::*;
+use serde::{Deserialize, Serialize};
+use std::ffi::CString;
+use std::sync::atomic::{AtomicU64, AtomicU8};
+use std::sync::{mpsc, Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
-#[derive(Deserialize, Debug)]
-struct Order {
+const ORDER_STREAM_ID: i32 = 1001;
+const RESULT_STREAM_ID: i32 = 2001;
+
+/// Wire format for an inbound order from order-sending's Aeron order
+/// channel (inside the HMAC-signed frame that `auth::verify` unwraps). KEEP
+/// IN SYNC WITH order-sending/src/main.rs::OrderWire — bincode encodes
+/// struct fields positionally (by declaration order and type, not by field
+/// name), so both sides must declare identical field order and types.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+struct OrderWire {
     order_id: u64,
-    symbol: String,
-    side: String,
+    symbol: u8,
+    side: bool,
     qty: u32,
+    #[allow(dead_code)] // received for wire compatibility; not used on this side
+    ts_ms: u64,
+}
+
+const SYMBOLS: [&str; 3] = ["BTC-USDT", "ETH-USDT", "SOL-USDT"];
+
+impl OrderWire {
+    fn symbol_str(&self) -> &'static str {
+        SYMBOLS.get(self.symbol as usize).copied().unwrap_or("UNKNOWN")
+    }
+    fn side_str(&self) -> &'static str {
+        if self.side { "BUY" } else { "SELL" }
+    }
+}
+
+fn aeron_dir() -> String {
+    std::env::var("AERON_DIR")
+        .unwrap_or_else(|_| {
+            #[cfg(target_os = "linux")]
+            unsafe {
+                extern "C" { fn getuid() -> u32; }
+                format!("/dev/shm/aeron-{}", getuid())
+            }
+            #[cfg(not(target_os = "linux"))]
+            "/dev/shm/aeron-0".to_string()
+        })
 }
 
 fn main() {
+    println!("[order-process] === STEP 1: Loading Configuration & Resolving Node ID ===");
     let cfg = init_config();
     let node_id = resolve_node_id();
     if !(1..=3).contains(&node_id) {
@@ -29,6 +76,32 @@ fn main() {
     }
 
     let self_node = find_node(node_id).expect("unknown NODE_ID");
+    println!(
+        "[order-process] Config initialized for Node ID {} ({}) — Host: {}, Raft Port: {}, Order Port: {}, Health Port: {}",
+        node_id, self_node.name, self_node.host, self_node.raft_port, self_node.order_port, self_node.health_port
+    );
+
+    println!("[order-process] === STEP 2: Starting monitoring Health Probe Responder ===");
+    // Trivial liveness responder for the monitoring service — independent of Aeron
+    // and the Raft control channel, so it comes up even before either does.
+    // Created here (before Raft/LeaderElection exists) and handed to it once
+    // it starts — see LeaderElection::start's role_atomic/term_atomic params
+    // — so the health responder can report this node's current role/term
+    // in its Pong reply without waiting for or depending on Raft startup.
+    let role_atomic = Arc::new(AtomicU8::new(Role::Follower.as_u8()));
+    let term_atomic = Arc::new(AtomicU64::new(0));
+    start_health_responder(
+        node_id,
+        &cfg.bind_host,
+        self_node.health_port,
+        Arc::clone(&role_atomic),
+        Arc::clone(&term_atomic),
+    );
+    println!(
+        "[health-probe] UDP liveness responder listening on {}:{}",
+        cfg.bind_host, self_node.health_port
+    );
+
     println!(
         "[role] {} (S2-{}) starting — peers: {}",
         node_name(node_id),
@@ -40,16 +113,145 @@ fn main() {
             .join(", ")
     );
 
-    let election = LeaderElection::start(node_id);
-    let order_socket = UdpSocket::bind((cfg.bind_host.as_str(), self_node.order_port))
-        .expect("failed to bind order channel");
+    println!("[order-process] === STEP 3: Connecting to Aeron Media Driver ===");
+    let aeron_dir_path = aeron_dir();
+    println!("[order-process] connecting to Aeron Media Driver at {aeron_dir_path}");
 
-    let result_socket =
-        UdpSocket::bind((cfg.bind_host.as_str(), 0)).expect("failed to bind result socket");
+    let ctx = AeronContext::new().expect("Aeron context");
+    let aeron_dir_cstr = CString::new(aeron_dir_path).unwrap();
+    ctx.set_dir(&aeron_dir_cstr).expect("set aeron dir");
+    ctx.set_error_handler(Some(|code: i32, msg: &str| {
+        eprintln!("[aeron] error {code}: {msg}");
+    })).expect("set error handler");
+
+    let aeron = Aeron::new(&ctx).expect("Aeron client");
+    aeron.start().expect("start aeron client");
+    println!("[order-process] Aeron client successfully connected to media driver");
+
+    println!("[order-process] === STEP 4: Initializing Aeron Order Subscription & Result Publication ===");
+    // Each S2 node subscribes on its own host:order_port.
+    // S1 (order-sending) publishes to each of these unicast endpoints.
+    let order_channel = format!(
+        "aeron:udp?endpoint={}:{}{}",
+        self_node.host, self_node.order_port, order_process::config::aeron_channel_tuning()
+    );
+    println!(
+        "[order-process] subscribing to orders on {order_channel} stream {ORDER_STREAM_ID}"
+    );
+    let order_channel_cstr = CString::new(order_channel).unwrap();
+    let order_subscription = aeron
+        .async_add_subscription(
+            &order_channel_cstr,
+            ORDER_STREAM_ID,
+            Handlers::NONE,
+            Handlers::NONE,
+        )
+        .expect("async_add_subscription (orders)")
+        .poll_blocking(Duration::from_secs(10))
+        .expect("order subscription ready");
+    println!("[order-process] order channel subscription ACTIVE on stream {ORDER_STREAM_ID}");
+
+    // All 3 nodes create this publication. Only the active leader calls offer().
+    let result_channel = format!(
+        "aeron:udp?endpoint={}:{}{}",
+        cfg.s3_host, cfg.s3_port, order_process::config::aeron_channel_tuning()
+    );
+    println!(
+        "[order-process] adding result publication → {result_channel} stream {RESULT_STREAM_ID}"
+    );
+    let result_channel_cstr = CString::new(result_channel).unwrap();
+    let result_pub = aeron
+        .async_add_publication(&result_channel_cstr, RESULT_STREAM_ID)
+        .expect("async_add_publication (results)")
+        .poll_blocking(Duration::from_secs(10))
+        .expect("result publication ready");
+    println!("[order-process] result channel publication ACTIVE on stream {RESULT_STREAM_ID}");
+
+    println!("[order-process] === STEP 5: Starting Raft Consensus Engine ===");
+    // Bounded hand-off from replay_server (S3's REPLAY_REQUEST) to the
+    // result publisher thread, which is the sole owner of `result_pub`.
+    let (replay_tx, replay_rx) = mpsc::sync_channel::<(u64, u64)>(64);
+    let election = LeaderElection::start(node_id, result_pub, replay_rx, role_atomic, term_atomic);
+
+    println!("[order-process] === STEP 5b: Starting S1<->S2 and S2<->S3 Replay Channels ===");
+    // Ingest-side sequence tracker: dedups every inbound order by order_id
+    // across the whole process lifetime (fixing the old per-batch-only
+    // `seen_ids` dedup) and detects gaps for the replay-request ticker.
+    // Marked in the polling thread only, so no lock contention on the
+    // decode/dedup hot path beyond this one uncontended mutex (mirrors the
+    // existing `wal: Mutex<Wal>` / `state: Mutex<RaftState>` pattern).
+    //
+    // Seeded from this node's own WAL (not a fresh watermark of 0) so a
+    // restart doesn't re-accept orders it already committed, and so the
+    // replay client's startup catch-up (below) asks order-sending for
+    // exactly what's actually missing.
+    let resume_from = election.max_committed_order_id();
+    if resume_from > 0 {
+        println!("[order-process] resuming ingest sequence tracker at order_id {resume_from}");
+    }
+    let tracker = Arc::new(Mutex::new(SequenceTracker::with_watermark(resume_from)));
+    start_replay_client(node_id, cfg.s1_host.clone(), cfg.s1_replay_port, Arc::clone(&tracker), resume_from);
+    start_replay_server(cfg.bind_host.clone(), self_node.replay_port, Arc::clone(&election), replay_tx);
+
+    println!("[order-process] === STEP 6: Spawning Order Ingress Polling Thread & Hot Loop ===");
+    // Bounded channel to apply backpressure if processing is slower than Aeron delivery
+    let (order_tx, order_rx) = crossbeam_channel::bounded::<OrderWire>(500_000);
+
+    let poll_tx = order_tx.clone();
+    let poll_tracker = Arc::clone(&tracker);
+    thread::spawn(move || {
+        let mut idle = BackoffIdleStrategy::new();
+        loop {
+            let verbose = order_process::config::verbose_raft();
+            let fragments = order_subscription
+                .poll_fn(|buf: &[u8], _hdr: AeronHeader| {
+                    match auth::verify(buf) {
+                        Some(payload) => match bincode::deserialize::<OrderWire>(payload) {
+                            Ok(order) => {
+                                // Dedup across the process lifetime (not just
+                                // this poll batch) — replayed and Aeron-redelivered
+                                // orders are only forwarded for processing once.
+                                //
+                                // Blocking, not try_send: this channel exists
+                                // specifically so processing slower than
+                                // Aeron delivery backpressures here (see its
+                                // doc comment below) rather than silently
+                                // dropping an order the tracker has already
+                                // marked "seen" — a drop *after* marking
+                                // would be permanently invisible to gap
+                                // detection/replay, defeating the entire
+                                // point of that mechanism. Blocking the
+                                // Aeron polling thread here is safe and
+                                // correct: it naturally throttles fragment
+                                // consumption, which Aeron's own flow
+                                // control then backpressures upstream to
+                                // order-sending.
+                                if poll_tracker.lock().unwrap().mark(order.order_id) {
+                                    let _ = poll_tx.send(order);
+                                }
+                            }
+                            Err(err) if verbose => eprintln!(
+                                "[order-process] dropped order ({} bytes payload): decode error: {err}",
+                                payload.len()
+                            ),
+                            Err(_) => {}
+                        },
+                        None if verbose => eprintln!(
+                            "[order-process] dropped order packet ({} bytes): HMAC failure — check CLUSTER_HMAC_KEY in .env",
+                            buf.len()
+                        ),
+                        None => {}
+                    }
+                }, 5000)
+                .unwrap_or(0);
+            idle.idle(fragments);
+        }
+    });
 
     let mut last_role_line = String::new();
-    let mut buf = [0u8; 4096];
+    let mut batch = Vec::with_capacity(20_000);
 
+    println!("[order-process] READY — entering main order batching & consensus loop...");
     loop {
         let line = election.role_summary();
         if line != last_role_line {
@@ -57,105 +259,79 @@ fn main() {
             last_role_line = line;
         }
 
-        order_socket
-            .set_read_timeout(Some(std::time::Duration::from_millis(200)))
-            .ok();
-        let (n, _src) = match order_socket.recv_from(&mut buf) {
-            Ok(v) => v,
-            Err(_) => continue,
-        };
-        let order: Order = match serde_json::from_slice(&buf[..n]) {
-            Ok(o) => o,
-            Err(_) => continue,
-        };
+        // Gather up to 20,000 orders in a single batch. Dedup already
+        // happened at ingest (poll_tracker, above) — every order reaching
+        // this channel is known-new.
+        batch.clear();
+
+        while batch.len() < 20_000 {
+            match order_rx.try_recv() {
+                Ok(order) => batch.push(order),
+                Err(_) => break, // channel empty
+            }
+        }
+
+        if batch.is_empty() {
+            thread::sleep(Duration::from_millis(1));
+            continue;
+        }
 
         if election.is_leader() {
-            process_order_as_leader(node_id, &order, &election, &result_socket);
+            process_orders_batch_as_leader(node_id, &batch, &election);
+        } else {
+            // As a follower, we just drain the channel so it doesn't back up
         }
     }
 }
 
-fn process_log_path() -> PathBuf {
-    PathBuf::from("logs").join("orders-processed.log")
-}
-
-fn append_process_log(line: &str) {
-    let path = process_log_path();
-    if let Some(parent) = path.parent() {
-        let _ = create_dir_all(parent);
-    }
-    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(&path) {
-        let _ = writeln!(file, "{line}");
-        let _ = file.flush();
-    }
-}
-
-fn process_order_as_leader(
+fn process_orders_batch_as_leader(
     node_id: u8,
-    order: &Order,
+    orders: &[OrderWire],
     election: &LeaderElection,
-    result_socket: &UdpSocket,
 ) {
     let leader = node_name(node_id);
-    println!(
-        "[order] {} LEADER received order_id={} {} {} qty={}",
-        leader, order.order_id, order.side, order.symbol, order.qty
-    );
-
+    let current_term = election.current_term();
     let outcomes = ["FILLED", "PARTIALLY_FILLED", "REJECTED"];
     let mut rng = rand::thread_rng();
-    let status = outcomes[rng.gen_range(0..outcomes.len())];
-    let filled_qty: u32 = if status == "REJECTED" {
-        0
-    } else {
-        rng.gen_range(1..=order.qty)
-    };
+    // Identical for every order in this batch — hoisted out of the per-order
+    // map and shared via Arc so a 20,000-order batch does 1 heap allocation
+    // here instead of 20,000 (Arc::clone below is a refcount bump, not an
+    // allocation; see the field's doc comment in wal.rs for wire-compat notes).
+    let processed_by: Arc<str> = Arc::from(format!("{} (S2-{})", leader, node_id));
 
-    let command = ReplicatedCommand {
-        order_id: order.order_id,
-        symbol: order.symbol.clone(),
-        side: order.side.clone(),
-        qty: order.qty,
-        status: status.to_string(),
-        filled_qty,
-        processed_by: format!("{} (S2-{})", leader, node_id),
-        term: election.current_term(),
-    };
+    let commands: Vec<ReplicatedCommand> = orders
+        .iter()
+        .map(|order| {
+            // qty == 0 can't be filled or partially filled — force REJECTED
+            // rather than calling gen_range(1..=0), which panics on an empty
+            // range and would crash the leader (and, via replay, every node
+            // that subsequently becomes leader for this order_id).
+            let status = if order.qty == 0 {
+                "REJECTED"
+            } else {
+                outcomes[rng.gen_range(0..outcomes.len())]
+            };
+            let filled_qty: u32 = if status == "REJECTED" {
+                0
+            } else {
+                rng.gen_range(1..=order.qty)
+            };
+            ReplicatedCommand {
+                order_id: order.order_id,
+                symbol: order.symbol_str().to_string(),
+                side: order.side_str().to_string(),
+                qty: order.qty,
+                status: status.to_string(),
+                filled_qty,
+                processed_by: Arc::clone(&processed_by),
+                term: current_term,
+            }
+        })
+        .collect();
 
-    if let Some(committed) = election.propose_command(command) {
-        let result = json!({
-            "order_id": committed.order_id,
-            "symbol": committed.symbol,
-            "side": committed.side,
-            "qty": committed.qty,
-            "status": committed.status,
-            "filled_qty": committed.filled_qty,
-            "processed_by": committed.processed_by,
-            "term": committed.term,
-        });
-
-        let cfg = order_process::config::config();
-        if let Ok(buf) = serde_json::to_vec(&result) {
-            let _ = result_socket.send_to(&buf, (cfg.s3_host.as_str(), cfg.s3_port));
-        }
-
-        let line = result.to_string();
-        append_process_log(&line);
-        println!(
-            "[order] {} LEADER committed order_id={} status={} filled={}/{} -> S3 {}:{} {}",
-            leader,
-            committed.order_id,
-            committed.status,
-            committed.filled_qty,
-            committed.qty,
-            cfg.s3_host,
-            cfg.s3_port,
-            line
-        );
-    } else {
-        println!(
-            "[order] {} LEADER dropped order_id={} (not committed / leadership lost)",
-            leader, order.order_id
-        );
-    }
+    // Result delivery to S3 is handled asynchronously by LeaderElection's
+    // background publisher thread once each entry commits (see
+    // leader_election.rs::result_publisher_loop) — this call's return value
+    // is used only as a flow-control signal here, never to gate delivery.
+    election.propose_batch(commands);
 }

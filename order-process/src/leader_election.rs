@@ -1,21 +1,77 @@
+use crate::auth;
 use crate::config::{
     allow_single_node_leader, election_timeout_max_ms, election_timeout_min_ms, find_node,
-    format_role_summary, heartbeat_interval_ms, node_name, peer_silent_ms, s2_nodes, verbose_raft,
-    S2Node,
+    format_role_summary, heartbeat_interval_ms, node_name, peer_silent_ms,
+    require_monitoring_for_single_node_leader, s2_nodes, verbose_raft, S2Node,
 };
 use crate::wal::{LogEntry, ReplicatedCommand, Wal};
+use crate::monitoring_client::{CachedVerdict, CorroborationOutcome, MonitoringClient};
 use rand::Rng;
+use rusteron_client::{AeronPublication, BusySpinIdleStrategy, IdleStrategy};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::net::{IpAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Keep AppendEntries UDP packets small so catch-up never exceeds MTU/recv buffer.
-const MAX_ENTRIES_PER_APPEND: usize = 32;
-const RECV_BUF_SIZE: usize = 65_535;
+/// Byte budget for a single `AppendEntries` UDP datagram, sized to stay
+/// safely under standard Ethernet MTU (1500 bytes) after IP/UDP headers, so
+/// replication never silently depends on IP fragmentation (a single lost
+/// fragment loses the whole datagram).
+const APPEND_BATCH_BYTE_BUDGET: usize = 1400;
+/// Upper bound on how many entries `replicate_to_peers` clones out of the
+/// WAL per peer per call before trimming to `APPEND_BATCH_BYTE_BUDGET` — see
+/// `Wal::entries_from_capped`'s doc comment for why this must not be
+/// unbounded (a peer stuck far behind, or simply offline, must not make this
+/// clone grow with total WAL size). Generous relative to what actually fits
+/// in the byte budget for any realistic `ReplicatedCommand` size.
+const MAX_REPLICATE_LOOKAHEAD_ENTRIES: usize = 512;
+const RECV_BUF_SIZE: usize = 2_000_000;
+
+/// Takes as many `entries` (in order) as fit within `budget_bytes` once
+/// bincode-encoded, always taking at least one entry even if it alone
+/// exceeds the budget, so replication keeps making progress regardless of
+/// how large a single command's payload gets.
+fn entries_within_budget(entries: Vec<LogEntry>, budget_bytes: usize) -> Vec<LogEntry> {
+    let mut taken = Vec::new();
+    let mut total = 0usize;
+    for entry in entries {
+        let size = bincode::serialized_size(&entry).unwrap_or(0) as usize;
+        if !taken.is_empty() && total + size > budget_bytes {
+            break;
+        }
+        total += size;
+        taken.push(entry);
+    }
+    taken
+}
+
+/// Binds a UDP socket for the Raft control channel with larger send/receive
+/// buffers than the OS default — at high replication rates this raw socket
+/// has no other flow control, so an undersized OS buffer is a real loss point.
+fn bind_tuned_udp_socket(bind_host: &str, port: u16) -> UdpSocket {
+    use socket2::{Domain, Protocol, Socket, Type};
+    use std::net::ToSocketAddrs;
+
+    let addr: std::net::SocketAddr = (bind_host, port)
+        .to_socket_addrs()
+        .expect("resolve raft control bind address")
+        .next()
+        .expect("no address for raft control bind host/port");
+    let socket = Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
+        .expect("create raft control socket");
+    socket
+        .set_recv_buffer_size(8 * 1024 * 1024)
+        .expect("set SO_RCVBUF on raft control socket");
+    socket
+        .set_send_buffer_size(8 * 1024 * 1024)
+        .expect("set SO_SNDBUF on raft control socket");
+    socket.bind(&addr.into()).expect("bind raft control socket");
+    socket.into()
+}
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Role {
@@ -24,8 +80,22 @@ pub enum Role {
     Leader,
 }
 
+impl Role {
+    /// Wire encoding for the health-probe Pong's `role` byte (see
+    /// health_probe.rs and order-monitoring's health_poll.rs, which decodes
+    /// this same 0/1/2 convention independently — no shared crate exists to
+    /// share an enum type across, so the mapping is duplicated by
+    /// convention, documented in both places).
+    pub fn as_u8(self) -> u8 {
+        match self {
+            Role::Follower => 0,
+            Role::Candidate => 1,
+            Role::Leader => 2,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Debug)]
-#[serde(tag = "type")]
 enum Message {
     RequestVote {
         term: u64,
@@ -68,6 +138,12 @@ struct RaftState {
     peer_last_contact: HashMap<u8, Instant>,
     /// true = available; used to print only on change.
     peer_available: HashMap<u8, bool>,
+    /// Per-peer timestamp of last successful AppendAck — used for leader lease.
+    peer_last_ack: HashMap<u8, Instant>,
+    /// The Raft term at which this node first became leader in the current tenure.
+    /// WAL entries at terms [leader_since_term, current_term] are safe to commit
+    /// even when a reconnecting peer bumps our term while we stay leader.
+    leader_since_term: u64,
 }
 
 fn random_timeout() -> Duration {
@@ -82,27 +158,76 @@ pub struct LeaderElection {
     state: Mutex<RaftState>,
     wal: Mutex<Wal>,
     is_leader_flag: AtomicBool,
+    /// Resolved peer IP addresses for the source-IP allowlist in recv_loop.
+    /// Built once at startup from NODE*_HOST config values.
+    allowed_ips: Vec<IpAddr>,
+    /// When this node started — used to enforce a startup grace period before
+    /// allowing single-node self-election. Prevents all nodes self-electing
+    /// simultaneously on startup before peers have had a chance to respond.
+    started_at: Instant,
+    /// Independent-monitoring corroboration client — see `monitoring_loop()` and
+    /// `peers_unreachable()`. A local isolation timeout is never sufficient on
+    /// its own to justify self-promotion; this is what corroborates it.
+    monitoring: MonitoringClient,
+    /// Lock-free, display-only role/term snapshot, refreshed once per Raft
+    /// tick (see `tick_loop()`). Shared with `health_probe.rs`'s responder
+    /// thread (created and passed in from main.rs before this struct
+    /// exists, since the health responder starts before Raft does) so it
+    /// can report this node's current role in its Pong reply — purely for
+    /// order-monitoring to display "who is leader"; never read back into
+    /// any consensus decision here.
+    role_atomic: Arc<AtomicU8>,
+    term_atomic: Arc<AtomicU64>,
 }
 
 impl LeaderElection {
     /// Binds the control-channel socket and spawns the background
     /// recv + election/heartbeat ticker threads. Returns immediately;
     /// call `.is_leader()` from anywhere to check current status.
-    pub fn start(self_id: u8) -> Arc<Self> {
+    pub fn start(
+        self_id: u8,
+        result_pub: AeronPublication,
+        replay_rx: Receiver<(u64, u64)>,
+        role_atomic: Arc<AtomicU8>,
+        term_atomic: Arc<AtomicU64>,
+    ) -> Arc<Self> {
         let self_node = find_node(self_id).expect("unknown node id");
         let peers: Vec<S2Node> = s2_nodes()
             .iter()
             .filter(|n| n.id != self_id)
             .cloned()
             .collect();
+        // Peers are unknown at startup — treat contact time as now so the
+        // peer_silent_ms window starts from this moment, not from the past.
+        // peer_available starts false so we don't assume reachability until
+        // we actually hear from each peer.
         let peer_last_contact: HashMap<u8, Instant> =
             peers.iter().map(|p| (p.id, Instant::now())).collect();
-        let peer_available: HashMap<u8, bool> = peers.iter().map(|p| (p.id, true)).collect();
+        let peer_available: HashMap<u8, bool> = peers.iter().map(|p| (p.id, false)).collect();
 
         let bind_host = crate::config::config().bind_host.as_str();
-        let socket = UdpSocket::bind((bind_host, self_node.raft_port))
-            .expect("failed to bind control channel");
+        let socket = bind_tuned_udp_socket(bind_host, self_node.raft_port);
         let wal = Wal::new(self_id).expect("failed to open replicated WAL");
+        // Seed commit_index from the last persisted checkpoint (clamped to
+        // what's actually in this WAL) instead of always starting at 0 — see
+        // commit_checkpoint.rs for why an unbounded max_order_id() at
+        // startup is unsafe. last_applied stays 0; apply_committed_entries()
+        // fast-forwards it to commit_index on the first tick, and
+        // result_publisher_loop never republishes historical entries since
+        // it only publishes while leader and fast-forwards last_published to
+        // last_applied whenever it isn't.
+        let initial_commit_index = crate::commit_checkpoint::load(self_id, wal.last_index());
+
+        // Build the IP allowlist from configured peer host strings.
+        // This is resolved once at startup; dynamic DNS changes require a restart.
+        let allowed_ips: Vec<IpAddr> = s2_nodes()
+            .iter()
+            .filter_map(|n| n.host.parse::<IpAddr>().ok())
+            .collect();
+
+        // Eagerly load CLUSTER_HMAC_KEY at startup so we panic immediately if it
+        // is missing, rather than the first time a packet is sent/received.
+        let _ = auth::cluster_key();
 
         let election = Arc::new(LeaderElection {
             self_id,
@@ -116,22 +241,36 @@ impl LeaderElection {
                 votes: HashSet::new(),
                 next_index: HashMap::new(),
                 match_index: HashMap::new(),
-                commit_index: 0,
+                commit_index: initial_commit_index,
                 last_applied: 0,
                 last_heartbeat: Instant::now(),
                 election_timeout: random_timeout(),
                 last_peer_contact: Instant::now(),
                 peer_last_contact,
                 peer_available,
+                peer_last_ack: HashMap::new(),
+                leader_since_term: 0,
             }),
             wal: Mutex::new(wal),
             is_leader_flag: AtomicBool::new(false),
+            allowed_ips,
+            started_at: Instant::now(),
+            monitoring: MonitoringClient::new(),
+            role_atomic,
+            term_atomic,
         });
 
         println!(
             "[role] {} started as FOLLOWER (waiting for leader)",
             node_name(self_id)
         );
+        if !election.monitoring.is_configured() && require_monitoring_for_single_node_leader() {
+            println!(
+                "[monitoring] no monitoring_HOST configured — single-node self-promotion is disabled \
+                 (REQUIRE_monitoring_FOR_SINGLE_NODE_LEADER=true); set monitoring_HOST or set that flag \
+                 to false to restore the legacy blind-timeout behavior"
+            );
+        }
 
         let recv_handle = Arc::clone(&election);
         thread::spawn(move || recv_handle.recv_loop());
@@ -139,7 +278,144 @@ impl LeaderElection {
         let tick_handle = Arc::clone(&election);
         thread::spawn(move || tick_handle.tick_loop());
 
+        let commit_driver_handle = Arc::clone(&election);
+        thread::spawn(move || commit_driver_handle.commit_driver_loop());
+
+        let monitoring_handle = Arc::clone(&election);
+        thread::spawn(move || monitoring_handle.monitoring_loop());
+
+        let publish_handle = Arc::clone(&election);
+        thread::spawn(move || publish_handle.result_publisher_loop(result_pub, replay_rx));
+
+        let checkpoint_handle = Arc::clone(&election);
+        thread::spawn(move || checkpoint_handle.commit_checkpoint_loop());
+
         election
+    }
+
+    /// Persists `commit_index` on a bounded interval — see
+    /// commit_checkpoint.rs for why. Writes only when it changed since the
+    /// last tick, and the disk write happens outside the state lock.
+    fn commit_checkpoint_loop(&self) {
+        let mut last_written = 0u64;
+        loop {
+            thread::sleep(Duration::from_millis(crate::commit_checkpoint::CHECKPOINT_INTERVAL_MS));
+            let current = { self.state.lock().unwrap().commit_index };
+            if current != last_written {
+                crate::commit_checkpoint::save(self.self_id, current);
+                last_written = current;
+            }
+        }
+    }
+
+    /// Watches `last_applied` and streams each newly-committed entry's result
+    /// to S3 as soon as it commits, independent of which (if any)
+    /// `propose_batch()` call originally proposed it. This is what fixes the
+    /// bug where `propose_batch()`'s bounded wait timing out used to mean the
+    /// result for that specific batch was never sent to S3, even though the
+    /// entry was already correctly committed in the WAL.
+    ///
+    /// Only publishes while this node holds leadership. On losing leadership
+    /// the watermark fast-forwards to the current `last_applied` (not reset
+    /// to 0), so a later re-election doesn't republish old history it
+    /// already sent in an earlier tenure.
+    ///
+    /// Note: `last_published` starts at 0 for a freshly started process. If
+    /// this node's on-disk WAL already contains committed entries from a
+    /// previous run the first time it becomes leader in this process's
+    /// lifetime, those get republished once. This is harmless — order-receiver
+    /// already deduplicates by `order_id` — and is accepted as simpler than
+    /// tracking a persisted publish watermark across restarts, which this
+    /// benchmark-proof scope doesn't need.
+    /// Signs and offers one committed entry's command to the result
+    /// channel, retrying while the error is retryable. Used for both live
+    /// commits and replay traffic so the two are indistinguishable on the
+    /// wire (order-receiver dedups either by order_id).
+    fn offer_result(&self, result_pub: &AeronPublication, idle: &mut BusySpinIdleStrategy, command: &ReplicatedCommand) {
+        let Ok(bytes) = bincode::serialize(command) else { return };
+        let frame = auth::sign(&bytes);
+        loop {
+            match result_pub.offer(&frame) {
+                Ok(_) => break,
+                Err(e) if e.is_retryable() => {
+                    idle.idle(0);
+                    continue;
+                }
+                Err(e) => {
+                    eprintln!("[S2-{}] result publish error: {e}", self.self_id);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn result_publisher_loop(&self, result_pub: AeronPublication, replay_rx: Receiver<(u64, u64)>) {
+        let mut idle = BusySpinIdleStrategy;
+        let mut last_published: u64 = 0;
+        loop {
+            if !self.is_leader() {
+                let last_applied = self.state.lock().unwrap().last_applied;
+                last_published = last_applied;
+                // Requests queued while we weren't leader are stale — a
+                // follower must never publish on the result channel.
+                while replay_rx.try_recv().is_ok() {}
+                thread::sleep(Duration::from_millis(5));
+                continue;
+            }
+
+            // Serve one pending replay request (bounded by the WAL scan's
+            // own results) before resuming live publishing, so a S3 replay
+            // request doesn't wait behind unbounded live traffic.
+            if let Ok((from, to)) = replay_rx.try_recv() {
+                let entries = { self.wal.lock().unwrap().entries_with_order_id_range(from, to) };
+                for entry in &entries {
+                    // Leadership can be lost mid-burst (e.g. a higher-term
+                    // AppendEntries arrives on recv_loop while we're partway
+                    // through a large S3 catch-up replay) — followers must
+                    // stay silent on the result channel, so stop immediately
+                    // rather than finishing the burst.
+                    if !self.is_leader() {
+                        break;
+                    }
+                    self.offer_result(&result_pub, &mut idle, &entry.command);
+                }
+                if verbose_raft() {
+                    println!(
+                        "[S2-{}] replayed {} committed order(s) (order_id {}..={}) to S3",
+                        self.self_id, entries.len(), from, to
+                    );
+                }
+                continue;
+            }
+
+            let last_applied = self.state.lock().unwrap().last_applied;
+            if last_published >= last_applied {
+                thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+
+            let next = last_published + 1;
+            let entry = { self.wal.lock().unwrap().entry_at(next) };
+            match entry {
+                Some(entry) => {
+                    self.offer_result(&result_pub, &mut idle, &entry.command);
+                    if verbose_raft() {
+                        println!(
+                            "[order] {} LEADER committed order_id={} status={} filled={}/{}",
+                            node_name(self.self_id), entry.command.order_id,
+                            entry.command.status, entry.command.filled_qty,
+                            entry.command.qty,
+                        );
+                    }
+                    last_published = next;
+                }
+                None => {
+                    // Not yet visible in this thread's WAL snapshot (race
+                    // with the writer) - retry shortly rather than skipping.
+                    thread::sleep(Duration::from_millis(1));
+                }
+            }
+        }
     }
 
     pub fn is_leader(&self) -> bool {
@@ -152,6 +428,21 @@ impl LeaderElection {
 
     pub fn current_term(&self) -> u64 {
         self.state.lock().unwrap().term
+    }
+
+    /// Highest `order_id` this node has already committed to its own WAL —
+    /// used at startup to seed the ingest `SequenceTracker`'s watermark and
+    /// fire a catch-up `REPLAY_REQUEST` to order-sending (see main.rs and
+    /// replay_client.rs), regardless of Raft role (a follower's WAL is just
+    /// as valid a source of "what have I already got" as a leader's).
+    ///
+    /// Bounded by `commit_index`, not every entry on disk — see
+    /// commit_checkpoint.rs and `Wal::max_order_id_up_to` for why an
+    /// unbounded scan is unsafe (an uncommitted leader tail at crash time
+    /// can later be truncated by a legitimate new leader).
+    pub fn max_committed_order_id(&self) -> u64 {
+        let commit_index = self.state.lock().unwrap().commit_index;
+        self.wal.lock().unwrap().max_order_id_up_to(commit_index)
     }
 
     /// Role line including "not available" for silent peers.
@@ -213,7 +504,10 @@ impl LeaderElection {
         while start.elapsed() < Duration::from_millis(1500) {
             {
                 let st = self.state.lock().unwrap();
-                if st.role != Role::Leader || st.term != term {
+                // Only abort if we lost leadership entirely.
+                // A term bump while staying leader (log-dominance protection) is
+                // fine — the entry is still committed under our tenure.
+                if st.role != Role::Leader {
                     return None;
                 }
                 if st.last_applied >= entry.index {
@@ -228,9 +522,110 @@ impl LeaderElection {
         None
     }
 
+    /// Appends `commands` to this leader's WAL and kicks off replication,
+    /// then returns immediately — it does NOT wait for quorum commit.
+    ///
+    /// It used to busy-poll for up to 1500ms until the batch was
+    /// majority-committed before returning, which serialized the caller's
+    /// ingest loop behind a UDP round-trip to a quorum of peers on every
+    /// single batch (the dominant end-to-end throughput ceiling: batch N+1
+    /// couldn't even start building until batch N committed). That wait was
+    /// never a correctness requirement — result_publisher_loop already
+    /// streams each entry to S3 independently as soon as it commits,
+    /// regardless of which propose_batch() call proposed it (see that
+    /// function's doc comment), and apply_committed_entries() only ever
+    /// advances past majority-replicated entries. So the wait was pure
+    /// (accidental) backpressure, not a safety gate.
+    ///
+    /// Commit detection for whatever this call just appended continues via
+    /// the dedicated commit_driver_loop thread (started in `new()`), which
+    /// drives replicate_to_peers()/try_advance_commit() at ~1ms granularity
+    /// whenever entries are outstanding — preserving the previous commit
+    /// latency without blocking this call's caller. The bounded ingest
+    /// channel between Aeron polling and batch-building (see main.rs,
+    /// crossbeam_channel::bounded(500_000)) remains the flow-control bound:
+    /// if followers fall far enough behind that WAL entries accumulate
+    /// uncommitted, that channel fills and Aeron's own backpressure
+    /// throttles order-sending, same as before this change.
+    ///
+    /// If this leader steps down before an appended batch commits, that
+    /// uncommitted WAL tail is simply overwritten/ignored by the next
+    /// leader via the normal AppendEntries consistency check — standard
+    /// Raft behavior, unaffected by this change.
+    ///
+    /// The returned `Vec` is the locally-appended commands (not necessarily
+    /// committed yet) — kept for API compatibility, but no caller currently
+    /// uses this return value for anything (see main.rs).
+    pub fn propose_batch(&self, commands: Vec<ReplicatedCommand>) -> Vec<ReplicatedCommand> {
+        if commands.is_empty() {
+            return Vec::new();
+        }
+        let term = self.current_term();
+        if !self.is_leader() {
+            return Vec::new();
+        }
+
+        let entries = {
+            let mut wal = self.wal.lock().unwrap();
+            match wal.append_leader_batch(term, commands) {
+                Ok(e) => e,
+                Err(_) => return Vec::new(),
+            }
+        };
+
+        if entries.is_empty() {
+            return Vec::new();
+        }
+
+        let max_index = entries.last().unwrap().index;
+
+        {
+            let mut st = self.state.lock().unwrap();
+            st.match_index.insert(self.self_id, max_index);
+        }
+
+        // One immediate attempt — enough on its own for a single-node (all
+        // peers down) leader, since quorum is 1. commit_driver_loop takes
+        // over from here for anything not yet committed.
+        self.replicate_to_peers();
+        self.try_advance_commit();
+
+        entries.into_iter().map(|e| e.command).collect()
+    }
+
+    /// Drives commit detection at a much tighter interval than tick_loop's
+    /// 50ms heartbeat cadence, so per-batch commit latency stays close to
+    /// what propose_batch() used to achieve by polling inline — without
+    /// blocking propose_batch()'s caller (see that function's doc comment).
+    /// Idles at a coarser interval whenever nothing is outstanding, so an
+    /// idle leader doesn't busy-poll for no reason.
+    fn commit_driver_loop(&self) {
+        loop {
+            let is_leader = self.state.lock().unwrap().role == Role::Leader;
+            if !is_leader {
+                thread::sleep(Duration::from_millis(20));
+                continue;
+            }
+
+            let last_applied = self.state.lock().unwrap().last_applied;
+            let last_index = self.wal.lock().unwrap().last_index();
+
+            if last_applied < last_index {
+                self.replicate_to_peers();
+                self.try_advance_commit();
+                thread::sleep(Duration::from_millis(1));
+            } else {
+                thread::sleep(Duration::from_millis(20));
+            }
+        }
+    }
+
     fn send(&self, peer: &S2Node, msg: &Message) {
-        if let Ok(buf) = serde_json::to_vec(msg) {
-            let _ = self.socket.send_to(&buf, (peer.host.as_str(), peer.raft_port));
+        if let Ok(buf) = bincode::serialize(msg) {
+            // Sign every outbound Raft control message with CLUSTER_HMAC_KEY.
+            // recv_loop on the peer side verifies this before handle_message().
+            let frame = auth::sign(&buf);
+            let _ = self.socket.send_to(&frame, (peer.host.as_str(), peer.raft_port));
         }
     }
 
@@ -298,17 +693,117 @@ impl LeaderElection {
     }
 
     fn peers_unreachable(&self, st: &RaftState) -> bool {
-        allow_single_node_leader() && self.alive_node_count(st) == 1
+        if !allow_single_node_leader() {
+            return false;
+        }
+        // Enforce a startup grace period equal to peer_silent_ms before allowing
+        // single-node self-election. This prevents all three nodes from treating
+        // each other as absent at startup and simultaneously self-electing.
+        let grace = Duration::from_millis(peer_silent_ms());
+        if self.started_at.elapsed() < grace {
+            return false;
+        }
+        if self.alive_node_count(st) != 1 {
+            return false;
+        }
+        if !require_monitoring_for_single_node_leader() {
+            // Legacy blind-timeout path (opt-out flag, local demo only) — a local
+            // timeout alone is treated as sufficient, exactly as before this change.
+            return true;
+        }
+        // A local timeout alone is never sufficient: this node cannot tell from the
+        // inside whether both peers are genuinely down or whether it's the one that
+        // got partitioned while its peers formed their own quorum. Promotion requires
+        // the independent monitoring's corroboration (see `monitoring_loop()`). No monitoring
+        // reachable is treated identically to "peers confirmed still up" — uncertainty
+        // always resolves to staying passive, never to promoting.
+        self.monitoring.cached_verdict() == CachedVerdict::SafeToPromote
     }
 
-    /// Majority of live nodes when single-node mode is on; else majority of full cluster (2 of 3).
-    fn quorum_for(&self, st: &RaftState) -> usize {
-        if allow_single_node_leader() {
-            let alive = self.alive_node_count(st);
-            alive / 2 + 1
-        } else {
-            (self.peers.len() + 1) / 2 + 1
+    /// Background thread: while this node looks locally isolated (per
+    /// `peers_unreachable`'s own timeout check), periodically asks the independent
+    /// monitoring to corroborate before caching a verdict `peers_unreachable()` can act
+    /// on. Runs on its own cadence, independent of `tick_loop`'s 50ms cycle, and never
+    /// performs I/O while holding `state`'s lock — a monitoring round-trip can take up to
+    /// `monitoring_TIMEOUT_MS`, which would otherwise stall `recv_loop` and all consensus.
+    fn monitoring_loop(&self) {
+        loop {
+            thread::sleep(Duration::from_millis(250));
+
+            if !allow_single_node_leader() || !require_monitoring_for_single_node_leader() {
+                continue;
+            }
+
+            let isolated = {
+                let st = self.state.lock().unwrap();
+                let grace = Duration::from_millis(peer_silent_ms());
+                self.started_at.elapsed() >= grace && self.alive_node_count(&st) == 1
+            };
+
+            if !isolated {
+                self.monitoring.reset_if_not_isolated();
+                continue;
+            }
+
+            if !self.monitoring.due_for_attempt() {
+                continue;
+            }
+
+            let term = self.current_term();
+            let (outcome, changed) = self.monitoring.attempt_corroboration(self.self_id, term);
+            if changed {
+                let name = node_name(self.self_id);
+                match outcome {
+                    CorroborationOutcome::SafeToPromote => println!(
+                        "[monitoring] corroboration confirmed both peers unreachable — {name} eligible to self-promote"
+                    ),
+                    CorroborationOutcome::DeniedBymonitoring => println!(
+                        "[monitoring] corroboration denied: monitoring reports a peer still reachable — {name} staying passive"
+                    ),
+                    CorroborationOutcome::MonitoringUnreachable => println!(
+                        "[monitoring] monitoring unreachable after {}ms — {name} staying passive",
+                        crate::config::monitoring_timeout_ms()
+                    ),
+                    CorroborationOutcome::NotConfigured => println!(
+                        "[monitoring] no monitoring configured — {name} staying passive (REQUIRE_monitoring_FOR_SINGLE_NODE_LEADER=true)"
+                    ),
+                }
+            }
         }
+    }
+
+    /// Majority needed to commit / win an election.
+    /// Always uses the full cluster size UNLESS all peers have been confirmed
+    /// unreachable for at least peer_silent_ms (single-node fallback).
+    fn quorum_for(&self, st: &RaftState) -> usize {
+        if self.peers_unreachable(st) {
+            // Every peer is silent — allow self-promotion with quorum of 1.
+            1
+        } else {
+            // Standard Raft majority of the full cluster.
+            self.peers.len().div_ceil(2) + 1
+        }
+    }
+
+    /// Returns true if this leader has received successful AppendAck from a
+    /// quorum of followers within the last 4 heartbeat intervals.
+    /// When true, the leader's authority is still fresh and it should NOT be
+    /// displaced by a RequestVote from a stale/reconnecting node.
+    fn has_quorum_lease(&self, st: &RaftState) -> bool {
+        let lease_window = Duration::from_millis(heartbeat_interval_ms() * 4);
+        let quorum_needed = self.peers.len().div_ceil(2) + 1; // majority of full cluster
+        // Count self + peers that acked within the lease window.
+        let recent_acks = 1 + self
+            .peers
+            .iter()
+            .filter(|p| {
+                st.peer_last_ack
+                    .get(&p.id)
+                    .map(|t| t.elapsed() < lease_window)
+                    .unwrap_or(false)
+            })
+            .count();
+        recent_acks >= quorum_needed
     }
 
     fn become_leader_locked(&self, st: &mut RaftState) {
@@ -326,18 +821,28 @@ impl LeaderElection {
         st.match_index.clear();
         st.match_index.insert(self.self_id, next_idx.saturating_sub(1));
         st.last_heartbeat = Instant::now();
+        // Record the term at which this leadership tenure started.
+        // When a reconnecting peer bumps our term (but we stay leader via log
+        // dominance), leader_since_term stays fixed so we can still commit
+        // entries created during the original term.
+        st.leader_since_term = st.term;
         self.is_leader_flag.store(true, Ordering::Relaxed);
-        let single = self.peers_unreachable(st);
-        if single {
+        if self.peers_unreachable(st) {
+            let mode = if !require_monitoring_for_single_node_leader() {
+                "legacy blind timeout"
+            } else {
+                "monitoring-corroborated"
+            };
             println!(
-                "[role] {} is LEADER (single-node: other machines unreachable)",
+                "[role] {} is LEADER (single-node: other machines unreachable, {mode})",
                 node_name(self.self_id)
             );
+        } else {
+            println!(
+                "[role] {}",
+                format_role_summary(Some(self.self_id), &self.unavailable_peer_ids(st))
+            );
         }
-        println!(
-            "[role] {}",
-            format_role_summary(Some(self.self_id), &self.unavailable_peer_ids(st))
-        );
     }
 
     fn replicate_to_peers(&self) {
@@ -354,33 +859,48 @@ impl LeaderElection {
             return;
         }
 
-        let wal = self.wal.lock().unwrap();
-        let leader_last = wal.last_index();
+        // Build every peer's AppendEntries payload while the WAL lock is held,
+        // then drop the lock before doing any network I/O — holding a state
+        // lock across a blocking socket send stalls every other thread
+        // waiting on this Mutex (propose_batch, apply_committed_entries,
+        // result_publisher_loop) for as long as the slowest peer's send()
+        // takes.
+        let outgoing: Vec<(&S2Node, u64, u64, Vec<LogEntry>)> = {
+            let wal = self.wal.lock().unwrap();
+            let leader_last = wal.last_index();
 
-        for peer in &self.peers {
-            let next_idx = next_map.get(&peer.id).copied().unwrap_or(leader_last + 1);
-            let prev_log_index = next_idx.saturating_sub(1);
-            let prev_log_term = wal.get_term_at(prev_log_index).unwrap_or(0);
-            let entries = if next_idx <= leader_last {
-                wal.entries_from(next_idx)
-                    .into_iter()
-                    .take(MAX_ENTRIES_PER_APPEND)
-                    .collect()
-            } else {
-                Vec::new()
-            };
+            self.peers
+                .iter()
+                .map(|peer| {
+                    let next_idx = next_map.get(&peer.id).copied().unwrap_or(leader_last + 1);
+                    let prev_log_index = next_idx.saturating_sub(1);
+                    let prev_log_term = wal.get_term_at(prev_log_index).unwrap_or(0);
+                    let entries = if next_idx <= leader_last {
+                        entries_within_budget(
+                            wal.entries_from_capped(next_idx, MAX_REPLICATE_LOOKAHEAD_ENTRIES),
+                            APPEND_BATCH_BYTE_BUDGET,
+                        )
+                    } else {
+                        Vec::new()
+                    };
 
-            if !entries.is_empty() && verbose_raft() {
-                println!(
-                    "[S2-{}] replicate -> S2-{} next_index={} batch={} leader_last={}",
-                    self.self_id,
-                    peer.id,
-                    next_idx,
-                    entries.len(),
-                    leader_last
-                );
-            }
+                    if !entries.is_empty() && verbose_raft() {
+                        println!(
+                            "[S2-{}] replicate -> S2-{} next_index={} batch={} leader_last={}",
+                            self.self_id,
+                            peer.id,
+                            next_idx,
+                            entries.len(),
+                            leader_last
+                        );
+                    }
 
+                    (peer, prev_log_index, prev_log_term, entries)
+                })
+                .collect()
+        };
+
+        for (peer, prev_log_index, prev_log_term, entries) in outgoing {
             self.send(
                 peer,
                 &Message::AppendEntries {
@@ -396,67 +916,71 @@ impl LeaderElection {
     }
 
     fn try_advance_commit(&self) {
-        let (current_term, current_commit, needed) = {
+        let (current_term, leader_since, current_commit, needed, match_map) = {
             let st = self.state.lock().unwrap();
-            (st.term, st.commit_index, self.quorum_for(&st))
+            (
+                st.term,
+                st.leader_since_term,
+                st.commit_index,
+                self.quorum_for(&st),
+                st.match_index.clone(),
+            )
         };
         let wal = self.wal.lock().unwrap();
         let last_index = wal.last_index();
-        drop(wal);
 
         let mut highest = current_commit;
         for idx in (current_commit + 1)..=last_index {
             let mut replicated = 1;
-            let st = self.state.lock().unwrap();
             for peer in &self.peers {
-                if st.match_index.get(&peer.id).copied().unwrap_or(0) >= idx {
+                if match_map.get(&peer.id).copied().unwrap_or(0) >= idx {
                     replicated += 1;
                 }
             }
-            drop(st);
 
             if replicated >= needed {
-                let wal = self.wal.lock().unwrap();
-                if wal.get_term_at(idx) == Some(current_term) {
+                let entry_term = wal.get_term_at(idx).unwrap_or(0);
+                if entry_term >= leader_since && entry_term <= current_term {
                     highest = idx;
                 }
+            } else {
+                break;
             }
         }
+        drop(wal);
 
         if highest > current_commit {
             let mut st = self.state.lock().unwrap();
             st.commit_index = highest;
+            drop(st);
         }
         self.apply_committed_entries();
     }
 
     fn apply_committed_entries(&self) {
-        loop {
-            let (next_to_apply, commit_index) = {
-                let st = self.state.lock().unwrap();
-                (st.last_applied + 1, st.commit_index)
-            };
-            if next_to_apply > commit_index {
-                break;
-            }
+        let (next_to_apply, commit_index) = {
+            let st = self.state.lock().unwrap();
+            (st.last_applied + 1, st.commit_index)
+        };
+        if next_to_apply > commit_index {
+            return;
+        }
 
-            let entry = {
-                let wal = self.wal.lock().unwrap();
-                wal.entry_at(next_to_apply)
-            };
-            if let Some(applied) = entry {
-                if verbose_raft() {
-                    println!(
-                        "[S2-{}] applied index={} term={} order_id={}",
-                        self.self_id, applied.index, applied.term, applied.command.order_id
-                    );
-                }
-                let mut st = self.state.lock().unwrap();
-                if st.last_applied < applied.index {
-                    st.last_applied = applied.index;
-                }
+        let mut highest_applied = next_to_apply - 1;
+        let wal = self.wal.lock().unwrap();
+        for idx in next_to_apply..=commit_index {
+            if wal.entry_at(idx).is_some() {
+                highest_applied = idx;
             } else {
                 break;
+            }
+        }
+        drop(wal);
+
+        if highest_applied >= next_to_apply {
+            let mut st = self.state.lock().unwrap();
+            if st.last_applied < highest_applied {
+                st.last_applied = highest_applied;
             }
         }
     }
@@ -475,6 +999,14 @@ impl LeaderElection {
 
             let action = {
                 let mut st = self.state.lock().unwrap();
+                // Refreshed every tick (50ms) rather than at every individual
+                // role/term mutation site — one touch point instead of
+                // several scattered ones, and 50ms is far more precise than
+                // this needs to be (health probes poll every 500ms by
+                // default). Read lock-free by health_probe.rs's responder;
+                // display-only, never used for any consensus decision.
+                self.role_atomic.store(st.role.as_u8(), Ordering::Relaxed);
+                self.term_atomic.store(st.term, Ordering::Relaxed);
                 match st.role {
                     Role::Leader => Action::Replicate,
                     Role::Candidate => {
@@ -565,11 +1097,36 @@ impl LeaderElection {
     fn recv_loop(&self) {
         let mut buf = [0u8; RECV_BUF_SIZE];
         loop {
-            let (n, _src) = match self.socket.recv_from(&mut buf) {
+            let (n, src) = match self.socket.recv_from(&mut buf) {
                 Ok(v) => v,
                 Err(_) => continue,
             };
-            let msg: Message = match serde_json::from_slice(&buf[..n]) {
+
+            // ── Source-IP allowlist ────────────────────────────────────────
+            // Drop packets from any IP that is not a configured cluster node.
+            // This is a first-pass filter; HMAC is the cryptographic guarantee.
+            if !self.allowed_ips.contains(&src.ip()) {
+                if verbose_raft() {
+                    eprintln!("[S2-{}] dropping Raft packet from unknown src {src}", self.self_id);
+                }
+                continue;
+            }
+
+            // ── HMAC verification ────────────────────────────────────────
+            // Reject any Raft message that lacks a valid CLUSTER_HMAC_KEY signature.
+            // Without this, any host can forge RequestVote to disrupt leadership.
+            let payload = match auth::verify(&buf[..n]) {
+                Some(p) => p,
+                None => {
+                    eprintln!(
+                        "[S2-{}] dropping Raft packet from {src}: HMAC failure ({n} bytes)",
+                        self.self_id
+                    );
+                    continue;
+                }
+            };
+
+            let msg: Message = match bincode::deserialize(payload) {
                 Ok(m) => m,
                 Err(err) => {
                     if verbose_raft() {
@@ -607,20 +1164,66 @@ impl LeaderElection {
 
         // Term fencing: anyone with a higher term is more current than us.
         if incoming_term > st.term {
-            let was_leader = st.role == Role::Leader;
-            st.term = incoming_term;
-            st.role = Role::Follower;
-            st.voted_for = None;
-            st.votes.clear();
-            st.next_index.clear();
-            st.match_index.clear();
-            st.last_heartbeat = Instant::now();
-            st.election_timeout = random_timeout();
-            if was_leader {
-                self.is_leader_flag.store(false, Ordering::Relaxed);
-                drop(st);
-                self.print_roles(None);
-                st = self.state.lock().unwrap();
+            // A leader should only step down on a RequestVote if the challenger
+            // actually has a more up-to-date log.  A node that was offline and
+            // accumulated a high term through repeated failed elections has a
+            // STALE log — it cannot have committed anything the leader hasn't.
+            // Letting it displace the current leader causes unnecessary churn.
+            //
+            // Protections (either is enough to stay leader):
+            //  1. Quorum lease  — majority of peers acked within last 4 heartbeats.
+            //  2. Log dominance — our log is at least as current as the candidate's.
+            let stay_as_leader = st.role == Role::Leader && {
+                match &msg {
+                    Message::RequestVote {
+                        last_log_index,
+                        last_log_term,
+                        ..
+                    } => {
+                        // Check log freshness (Raft §5.4.1 comparison).
+                        let (my_last_index, my_last_term) = {
+                            let wal = self.wal.lock().unwrap();
+                            (wal.last_index(), wal.last_term())
+                        };
+                        let candidate_log_is_current = *last_log_term > my_last_term
+                            || (*last_log_term == my_last_term
+                                && *last_log_index >= my_last_index);
+                        // Stay if our log is better OR we still hold quorum.
+                        !candidate_log_is_current || self.has_quorum_lease(&st)
+                    }
+                    // AppendEntries from a higher term = another node is already
+                    // a valid leader → always step down.
+                    _ => false,
+                }
+            };
+
+            st.term = incoming_term; // always adopt the higher term
+
+            if stay_as_leader {
+                // Keep leading; claim voted_for so we don't accidentally
+                // grant a vote to the stale challenger in this term.
+                st.voted_for = Some(self.self_id);
+                if verbose_raft() {
+                    println!(
+                        "[S2-{}] ignored stale RequestVote — staying LEADER at term {}",
+                        self.self_id, st.term
+                    );
+                }
+            } else {
+                let was_leader = st.role == Role::Leader;
+                st.role = Role::Follower;
+                st.voted_for = None;
+                st.votes.clear();
+                st.next_index.clear();
+                st.match_index.clear();
+                st.last_heartbeat = Instant::now();
+                st.election_timeout = random_timeout();
+                if was_leader {
+                    self.is_leader_flag.store(false, Ordering::Relaxed);
+                    drop(st);
+                    self.print_roles(None);
+                    st = self.state.lock().unwrap();
+                }
             }
         }
 
@@ -682,6 +1285,9 @@ impl LeaderElection {
             Message::VoteGranted { term, voter_id } => {
                 if st.role == Role::Candidate && term == st.term {
                     st.votes.insert(voter_id);
+                    // Reset the heartbeat timer so we don't immediately re-trigger
+                    // an election timeout while waiting to accumulate quorum.
+                    st.last_heartbeat = Instant::now();
                     if st.votes.len() >= self.quorum_for(&st) {
                         self.become_leader_locked(&mut st);
                         drop(st);
@@ -762,6 +1368,8 @@ impl LeaderElection {
                     let prev_match = st.match_index.get(&follower_id).copied().unwrap_or(0);
                     st.match_index.insert(follower_id, match_index);
                     st.next_index.insert(follower_id, match_index + 1);
+                    // Record the ack time for leader lease calculation.
+                    st.peer_last_ack.insert(follower_id, Instant::now());
                     if match_index > prev_match && verbose_raft() {
                         println!(
                             "[S2-{}] follower S2-{} matched through index {}",
@@ -785,5 +1393,49 @@ impl LeaderElection {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_entry(index: u64) -> LogEntry {
+        LogEntry {
+            index,
+            term: 1,
+            command: ReplicatedCommand {
+                order_id: index,
+                symbol: "BTC-USDT".to_string(),
+                side: "BUY".to_string(),
+                qty: 1,
+                status: "FILLED".to_string(),
+                filled_qty: 1,
+                processed_by: "Nitin (S2-1)".into(),
+                term: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn entries_within_budget_stops_before_exceeding_but_always_makes_progress() {
+        let entries: Vec<LogEntry> = (1..=1000).map(sample_entry).collect();
+        let one_entry_size = bincode::serialized_size(&entries[0]).unwrap() as usize;
+
+        let budget = one_entry_size * 5;
+        let batch = entries_within_budget(entries.clone(), budget);
+        assert!(!batch.is_empty());
+        assert!(
+            batch.len() <= 6,
+            "expected roughly 5 entries for a 5x-single-entry budget, got {}",
+            batch.len()
+        );
+
+        let tiny_budget = entries_within_budget(entries, 1);
+        assert_eq!(
+            tiny_budget.len(),
+            1,
+            "must always take at least one entry so replication keeps making progress"
+        );
     }
 }

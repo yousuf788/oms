@@ -2,6 +2,7 @@ use serde::{Deserialize, Serialize};
 use std::fs::{self, OpenOptions};
 use std::io::{self, Write};
 use std::path::PathBuf;
+use std::sync::Arc;
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct ReplicatedCommand {
@@ -11,7 +12,11 @@ pub struct ReplicatedCommand {
     pub qty: u32,
     pub status: String,
     pub filled_qty: u32,
-    pub processed_by: String,
+    // Arc<str>, not String: identical to it on the wire (bincode/serde encode
+    // both as length + UTF-8 bytes via serialize_str), but every order in a
+    // batch shares the same processed_by value — Arc::clone is a refcount
+    // bump instead of a fresh heap allocation per order (see main.rs).
+    pub processed_by: Arc<str>,
     pub term: u64,
 }
 
@@ -22,19 +27,78 @@ pub struct LogEntry {
     pub command: ReplicatedCommand,
 }
 
+/// Encodes `entry` as `bincode` and appends it to `buf` behind a 4-byte
+/// little-endian length prefix, so multiple records can be concatenated in
+/// one file and read back without a text delimiter (binary data isn't safely
+/// newline-delimited the way the old JSON-lines format was).
+fn write_framed_entry(buf: &mut Vec<u8>, entry: &LogEntry) -> io::Result<()> {
+    let encoded = bincode::serialize(entry)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+    buf.extend_from_slice(&(encoded.len() as u32).to_le_bytes());
+    buf.extend_from_slice(&encoded);
+    Ok(())
+}
+
+/// Reads as many complete length-prefixed records as `bytes` contains. Stops
+/// (without erroring) at a truncated trailing record — e.g. a length header
+/// with no body yet, from a process killed mid-write — since the WAL's
+/// durability model is OS-buffered writes, not fsync'd transactions.
+/// Same framing as `read_framed_entries`, but also returns each entry's
+/// starting byte offset in `bytes` (the position of its 4-byte length
+/// header) so a caller can later `set_len()` the file back to a point
+/// between two entries without rewriting anything.
+fn read_framed_entries_with_offsets(bytes: &[u8]) -> Vec<(u64, LogEntry)> {
+    let mut entries = Vec::new();
+    let mut pos = 0usize;
+    while pos + 4 <= bytes.len() {
+        let record_start = pos;
+        let len = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()) as usize;
+        pos += 4;
+        if pos + len > bytes.len() {
+            break;
+        }
+        if let Ok(entry) = bincode::deserialize::<LogEntry>(&bytes[pos..pos + len]) {
+            entries.push((record_start as u64, entry));
+        }
+        pos += len;
+    }
+    entries
+}
+
+#[cfg(test)]
+fn read_framed_entries(bytes: &[u8]) -> Vec<LogEntry> {
+    read_framed_entries_with_offsets(bytes).into_iter().map(|(_, entry)| entry).collect()
+}
+
 pub struct Wal {
     path: PathBuf,
+    file: fs::File,
     entries: Vec<LogEntry>,
+    // Parallel to `entries`: the byte offset (start of the length prefix) of
+    // each entry's on-disk record. Lets `truncate_from` discard a conflicting
+    // tail with a single `set_len()` instead of rewriting the whole file.
+    offsets: Vec<u64>,
+    file_len: u64,
 }
 
 impl Wal {
     pub fn new(node_id: u8) -> io::Result<Self> {
         let base_dir = std::env::var("ORDER_PROCESS_DATA_DIR")
             .map(PathBuf::from)
-            .unwrap_or_else(|_| PathBuf::from("order-process/data"));
+            .unwrap_or_else(|_| PathBuf::from("logs"));
         fs::create_dir_all(&base_dir)?;
-        let path = base_dir.join(format!("wal-s2-{}.log", node_id));
-        let entries = Self::load_entries(&path)?;
+        let path = if std::env::var("ORDER_PROCESS_DATA_DIR").is_ok() {
+            base_dir.join(format!("orders-processed-s2-{}.log", node_id))
+        } else {
+            base_dir.join("orders-processed.log")
+        };
+        let (entries, offsets) = Self::load_entries(&path)?;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)?;
+        let file_len = fs::metadata(&path)?.len();
+
         if crate::config::verbose_raft() {
             println!(
                 "[wal] opened {} ({} entries, last_index={})",
@@ -43,39 +107,46 @@ impl Wal {
                 entries.last().map(|e| e.index).unwrap_or(0)
             );
         }
-        Ok(Self { path, entries })
+        Ok(Self { path, file, entries, offsets, file_len })
     }
 
-    fn load_entries(path: &PathBuf) -> io::Result<Vec<LogEntry>> {
+    fn load_entries(path: &PathBuf) -> io::Result<(Vec<LogEntry>, Vec<u64>)> {
         if !path.exists() {
-            return Ok(Vec::new());
+            return Ok((Vec::new(), Vec::new()));
         }
-        let mut entries = Vec::new();
-        let content = fs::read_to_string(path)?;
-        for line in content.lines() {
-            if let Ok(entry) = serde_json::from_str::<LogEntry>(line) {
-                entries.push(entry);
-            }
-        }
-        entries.sort_by_key(|entry| entry.index);
-        Ok(entries)
+        let bytes = fs::read(path)?;
+        let mut pairs = read_framed_entries_with_offsets(&bytes);
+        pairs.sort_by_key(|(_, entry)| entry.index);
+        let (offsets, entries) = pairs.into_iter().unzip();
+        Ok((entries, offsets))
     }
 
-    fn persist(&self) -> io::Result<()> {
-        let mut out = String::new();
-        for entry in &self.entries {
-            let line = serde_json::to_string(entry)
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
-            out.push_str(&line);
-            out.push('\n');
+    fn append_single_entry(&mut self, entry: &LogEntry) -> io::Result<()> {
+        let mut buf = Vec::new();
+        write_framed_entry(&mut buf, entry)?;
+        self.offsets.push(self.file_len);
+        self.file.write_all(&buf)?;
+        self.file_len += buf.len() as u64;
+        Ok(())
+    }
+
+    /// Discards every locally-stored entry with `index >= from_index` — both
+    /// the in-memory Vec and the on-disk bytes — via one `set_len()` to the
+    /// byte offset of that entry, instead of rewriting every entry before it.
+    /// Only reached on a genuine Raft log conflict (differing term at the
+    /// same index); the documented leader-flapping failure mode can trigger
+    /// this repeatedly, so keeping it O(1) rather than O(WAL size) matters
+    /// on the consensus hot path.
+    fn truncate_from(&mut self, from_index: u64) -> io::Result<()> {
+        let split = self.entries.partition_point(|entry| entry.index < from_index);
+        if split >= self.entries.len() {
+            return Ok(());
         }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .open(&self.path)?;
-        file.write_all(out.as_bytes())?;
-        file.sync_all()?;
+        let offset = self.offsets[split];
+        self.entries.truncate(split);
+        self.offsets.truncate(split);
+        self.file.set_len(offset)?;
+        self.file_len = offset;
         Ok(())
     }
 
@@ -87,6 +158,10 @@ impl Wal {
         self.entries.len()
     }
 
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
     pub fn last_index(&self) -> u64 {
         self.entries.last().map(|entry| entry.index).unwrap_or(0)
     }
@@ -95,26 +170,116 @@ impl Wal {
         self.entries.last().map(|entry| entry.term).unwrap_or(0)
     }
 
+    /// Highest `order_id` among entries with Raft `index <= index_limit` —
+    /// NOT the same as `last_index()` (that's the Raft log position; this is
+    /// the business identity). Used to seed the ingest-side
+    /// `SequenceTracker`'s watermark and fire a startup catch-up
+    /// `REPLAY_REQUEST` to order-sending on restart, so this node
+    /// proactively recovers whatever it missed instead of waiting for a new
+    /// live order to reveal the gap.
+    ///
+    /// Bounded by `index_limit` (the last known-committed Raft index — see
+    /// `commit_checkpoint.rs`) rather than scanning every entry on disk,
+    /// because this WAL can hold an uncommitted leader tail at crash time
+    /// (`propose_batch` doesn't wait for quorum before returning). Seeding
+    /// the watermark from unbounded `entries` would let the tracker believe
+    /// it had "seen" order_ids that a legitimate new leader later truncates
+    /// via `truncate_from` — after which they'd never be re-requested.
+    pub fn max_order_id_up_to(&self, index_limit: u64) -> u64 {
+        self.entries
+            .iter()
+            .take_while(|e| e.index <= index_limit)
+            .map(|e| e.command.order_id)
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn get_term_at(&self, index: u64) -> Option<u64> {
         if index == 0 {
             return Some(0);
         }
+        if let Some(e) = self.entries.get((index - 1) as usize) {
+            if e.index == index {
+                return Some(e.term);
+            }
+        }
         self.entries
-            .iter()
-            .find(|entry| entry.index == index)
-            .map(|entry| entry.term)
+            .binary_search_by_key(&index, |entry| entry.index)
+            .ok()
+            .map(|idx| self.entries[idx].term)
     }
 
     pub fn entries_from(&self, from_index: u64) -> Vec<LogEntry> {
+        if from_index == 0 {
+            return self.entries.clone();
+        }
+        let start = match self.entries.binary_search_by_key(&from_index, |e| e.index) {
+            Ok(idx) => idx,
+            Err(idx) => idx,
+        };
+        self.entries[start..].to_vec()
+    }
+
+    /// Same as `entries_from`, but clones at most `max_entries` starting at
+    /// `from_index` instead of everything through the end of the log.
+    ///
+    /// `replicate_to_peers` is the only caller, and it immediately discards
+    /// everything past `APPEND_BATCH_BYTE_BUDGET` anyway via
+    /// `entries_within_budget` — but `entries_from` unconditionally cloned
+    /// the *entire* remaining tail first. For a peer whose `next_index`
+    /// never advances (offline, or simply this being a single-node
+    /// deployment where the other two configured peers never run), that
+    /// clone's size grows without bound as the WAL grows, since every
+    /// batch's `replicate_to_peers()` call re-clones from the same stuck
+    /// `next_index` through an ever-growing `last_index`. That's an O(log
+    /// size) cost paid on every single batch, not just this occasional
+    /// control-path replay lookups the rest of this file's comments
+    /// document as accepting O(n) for — a real regression once
+    /// `propose_batch` stopped throttling how often replication fires (see
+    /// its doc comment in leader_election.rs).
+    pub fn entries_from_capped(&self, from_index: u64, max_entries: usize) -> Vec<LogEntry> {
+        if from_index == 0 {
+            return self.entries.iter().take(max_entries).cloned().collect();
+        }
+        let start = match self.entries.binary_search_by_key(&from_index, |e| e.index) {
+            Ok(idx) => idx,
+            Err(idx) => idx,
+        };
+        let end = (start + max_entries).min(self.entries.len());
+        self.entries[start..end].to_vec()
+    }
+
+    /// Committed entries whose `command.order_id` falls in `[from, to]`
+    /// (inclusive; `to = u64::MAX` means "everything from `from` onward").
+    /// Serves REPLAY_REQUEST for the S2->S3 hop, where the caller only
+    /// knows order_id, not this WAL's Raft `index` — the two aren't
+    /// guaranteed identical (see replay_server.rs), so this is a linear
+    /// scan of in-memory entries rather than an indexed lookup. That's
+    /// acceptable for a rare, bounded, control-path operation; if this ever
+    /// shows up as a hot path, add a secondary order_id index (deferred —
+    /// this system also has no WAL retention/truncation yet, so `entries`
+    /// only grows for the life of the process either way).
+    pub fn entries_with_order_id_range(&self, from: u64, to: u64) -> Vec<LogEntry> {
         self.entries
             .iter()
-            .filter(|entry| entry.index >= from_index)
+            .filter(|e| e.command.order_id >= from && e.command.order_id <= to)
             .cloned()
             .collect()
     }
 
     pub fn entry_at(&self, index: u64) -> Option<LogEntry> {
-        self.entries.iter().find(|entry| entry.index == index).cloned()
+        if index == 0 {
+            return None;
+        }
+        if let Some(e) = self.entries.get((index - 1) as usize) {
+            if e.index == index {
+                return Some(e.clone());
+            }
+        }
+        self.entries
+            .binary_search_by_key(&index, |entry| entry.index)
+            .ok()
+            .map(|idx| self.entries[idx].clone())
     }
 
     pub fn append_leader_entry(&mut self, term: u64, command: ReplicatedCommand) -> io::Result<LogEntry> {
@@ -123,9 +288,31 @@ impl Wal {
             term,
             command,
         };
+        self.append_single_entry(&entry)?;
         self.entries.push(entry.clone());
-        self.persist()?;
         Ok(entry)
+    }
+
+    pub fn append_leader_batch(
+        &mut self,
+        term: u64,
+        commands: Vec<ReplicatedCommand>,
+    ) -> io::Result<Vec<LogEntry>> {
+        let mut entries = Vec::with_capacity(commands.len());
+        let mut buf = Vec::with_capacity(commands.len() * 96);
+        let mut offset = self.file_len;
+        for (index, command) in (self.last_index() + 1..).zip(commands) {
+            let entry = LogEntry { index, term, command };
+            let before = buf.len();
+            write_framed_entry(&mut buf, &entry)?;
+            self.offsets.push(offset);
+            offset += (buf.len() - before) as u64;
+            entries.push(entry);
+        }
+        self.file.write_all(&buf)?;
+        self.file_len = offset;
+        self.entries.extend(entries.clone());
+        Ok(entries)
     }
 
     pub fn append_entries_from_leader(
@@ -144,15 +331,63 @@ impl Wal {
         for incoming in incoming_entries {
             if let Some(existing) = self.entry_at(incoming.index) {
                 if existing.term != incoming.term {
-                    self.entries.retain(|entry| entry.index < incoming.index);
+                    self.truncate_from(incoming.index)?;
+                    self.append_single_entry(incoming)?;
                     self.entries.push(incoming.clone());
                 }
+                // else: identical entry already present — nothing to do.
             } else {
+                self.append_single_entry(incoming)?;
                 self.entries.push(incoming.clone());
             }
         }
-        self.entries.sort_by_key(|entry| entry.index);
-        self.persist()?;
         Ok(Some(self.last_index()))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_entry(index: u64) -> LogEntry {
+        LogEntry {
+            index,
+            term: 1,
+            command: ReplicatedCommand {
+                order_id: index,
+                symbol: "BTC-USDT".to_string(),
+                side: "BUY".to_string(),
+                qty: 5,
+                status: "FILLED".to_string(),
+                filled_qty: 5,
+                processed_by: "Nitin (S2-1)".into(),
+                term: 1,
+            },
+        }
+    }
+
+    #[test]
+    fn framed_entries_round_trip() {
+        let mut buf = Vec::new();
+        write_framed_entry(&mut buf, &sample_entry(7)).unwrap();
+        write_framed_entry(&mut buf, &sample_entry(8)).unwrap();
+
+        let decoded = read_framed_entries(&buf);
+
+        assert_eq!(decoded.len(), 2);
+        assert_eq!(decoded[0].index, 7);
+        assert_eq!(decoded[0].command.order_id, 7);
+        assert_eq!(decoded[1].index, 8);
+    }
+
+    #[test]
+    fn read_framed_entries_stops_at_truncated_trailing_record() {
+        let mut buf = Vec::new();
+        write_framed_entry(&mut buf, &sample_entry(1)).unwrap();
+        buf.extend_from_slice(&999u32.to_le_bytes());
+
+        let decoded = read_framed_entries(&buf);
+
+        assert_eq!(decoded.len(), 1, "must not panic or return garbage for a truncated trailing record");
     }
 }

@@ -8,5 +8,10 @@ name = "order-receiver"
 path = "src/main.rs"
 
 [dependencies]
-serde_json = "1"
+serde = { version = "1", features = ["derive"] }
+bincode = "1.3"
 dotenvy = "0.15"
+rusteron-client = { version = "0.2", features = ["static", "precompile"] }
+hmac = "0.12"
+sha2 = "0.10"
+ctrlc = { version = "3.5.2", features = ["termination"] }

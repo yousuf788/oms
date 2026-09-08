@@ -1,0 +1,220 @@
+// Node-side corroboration client. Talks to the independent monitoring service over its
+// own dedicated UDP socket (never the Raft control socket). All I/O here is blocking
+// with a bounded timeout and MUST be called outside any `RaftState` lock — see
+// `LeaderElection::monitoring_loop()` in leader_election.rs, which is the only caller.
+//
+// Hard rule (per the design this implements): any failure to get an affirmative
+// "peers are also down" answer — no monitoring configured, send error, timeout, garbage
+// response — resolves to "stay passive". Uncertainty never resolves to promotion.
+
+use crate::auth;
+use crate::config::{monitoring_host, monitoring_port, monitoring_retry_interval_ms, monitoring_timeout_ms};
+use serde::{Deserialize, Serialize};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "type")]
+enum CorroborationMsg {
+    Request {
+        request_id: u64,
+        requester_id: u8,
+        term: u64,
+    },
+    Response {
+        request_id: u64,
+        #[allow(dead_code)]
+        peers_checked: Vec<PeerCheck>,
+        verdict: Verdict,
+    },
+}
+
+#[derive(Serialize, Deserialize)]
+struct PeerCheck {
+    #[allow(dead_code)]
+    node_id: u8,
+    #[allow(dead_code)]
+    reachable: bool,
+    #[allow(dead_code)]
+    age_ms: u64,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+enum Verdict {
+    SafeToPromote,
+    PeersStillUp,
+}
+
+/// The fast, lock-only value `peers_unreachable()` reads. Never involves I/O.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum CachedVerdict {
+    Unknown,
+    SafeToPromote,
+    StayPassive,
+}
+
+/// Richer result of one corroboration attempt, used only for operator-facing logging
+/// so "monitoring said no" is distinguishable from "monitoring didn't answer" — the only
+/// diagnostic tool available in this repo (no test suite).
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum CorroborationOutcome {
+    NotConfigured,
+    SafeToPromote,
+    DeniedBymonitoring,
+    MonitoringUnreachable,
+}
+
+struct CorroborationCache {
+    verdict: CachedVerdict,
+    last_outcome: Option<CorroborationOutcome>,
+    updated_at: Instant,
+}
+
+pub struct MonitoringClient {
+    addr: Option<SocketAddr>,
+    socket: Option<UdpSocket>,
+    timeout: Duration,
+    retry_interval: Duration,
+    cache: Mutex<CorroborationCache>,
+}
+
+impl Default for MonitoringClient {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MonitoringClient {
+    pub fn new() -> Self {
+        let addr = monitoring_host().and_then(|host| {
+            (host.as_str(), monitoring_port())
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut it| it.next())
+        });
+        let socket = if addr.is_some() {
+            UdpSocket::bind(("0.0.0.0", 0)).ok()
+        } else {
+            None
+        };
+        MonitoringClient {
+            addr,
+            socket,
+            timeout: Duration::from_millis(monitoring_timeout_ms()),
+            retry_interval: Duration::from_millis(monitoring_retry_interval_ms()),
+            cache: Mutex::new(CorroborationCache {
+                verdict: CachedVerdict::Unknown,
+                last_outcome: None,
+                updated_at: Instant::now(),
+            }),
+        }
+    }
+
+    pub fn is_configured(&self) -> bool {
+        self.addr.is_some()
+    }
+
+    /// Non-blocking, lock-only read — safe to call from anywhere, including while
+    /// another lock (e.g. `RaftState`) is held.
+    pub fn cached_verdict(&self) -> CachedVerdict {
+        self.cache.lock().unwrap().verdict
+    }
+
+    /// Call once per tick from the background monitoring loop when the node is NOT
+    /// currently isolated, so a stale verdict doesn't linger once peers return.
+    pub fn reset_if_not_isolated(&self) {
+        let mut c = self.cache.lock().unwrap();
+        c.verdict = CachedVerdict::Unknown;
+        c.last_outcome = None;
+    }
+
+    /// Whether enough time has passed since the last attempt to try again —
+    /// keeps this from hammering the monitoring every 250ms while isolated.
+    pub fn due_for_attempt(&self) -> bool {
+        let c = self.cache.lock().unwrap();
+        c.verdict == CachedVerdict::Unknown || c.updated_at.elapsed() >= self.retry_interval
+    }
+
+    /// Performs one corroboration round-trip (blocking, up to `self.timeout`).
+    /// MUST be called outside any Raft lock. Returns the outcome (for logging) and
+    /// whether it differs from the last attempt's outcome (for rate-limited logging).
+    pub fn attempt_corroboration(&self, requester_id: u8, term: u64) -> (CorroborationOutcome, bool) {
+        let outcome = self.attempt_corroboration_inner(requester_id, term);
+        let verdict = match outcome {
+            CorroborationOutcome::SafeToPromote => CachedVerdict::SafeToPromote,
+            CorroborationOutcome::DeniedBymonitoring
+            | CorroborationOutcome::MonitoringUnreachable
+            | CorroborationOutcome::NotConfigured => CachedVerdict::StayPassive,
+        };
+        let mut c = self.cache.lock().unwrap();
+        let changed = c.last_outcome != Some(outcome);
+        c.verdict = verdict;
+        c.last_outcome = Some(outcome);
+        c.updated_at = Instant::now();
+        (outcome, changed)
+    }
+
+    fn attempt_corroboration_inner(&self, requester_id: u8, term: u64) -> CorroborationOutcome {
+        let (addr, socket) = match (self.addr, &self.socket) {
+            (Some(a), Some(s)) => (a, s),
+            _ => return CorroborationOutcome::NotConfigured,
+        };
+
+        let request_id: u64 = rand::random();
+        let request = CorroborationMsg::Request { request_id, requester_id, term };
+        let inner_payload = match serde_json::to_vec(&request) {
+            Ok(p) => p,
+            Err(_) => return CorroborationOutcome::MonitoringUnreachable,
+        };
+        // Sign the request with monitoring_HMAC_KEY so the monitoring can reject
+        // forged or replayed corroboration requests.
+        let payload = auth::sign_monitoring(&inner_payload);
+
+        let deadline = Instant::now() + self.timeout;
+        let resend_at = Instant::now() + self.timeout / 3;
+        let _ = socket.send_to(&payload, addr);
+        let mut resent = false;
+
+        let mut buf = [0u8; 1024];
+        loop {
+            let now = Instant::now();
+            if now >= deadline {
+                return CorroborationOutcome::MonitoringUnreachable;
+            }
+            if !resent && now >= resend_at {
+                let _ = socket.send_to(&payload, addr);
+                resent = true;
+            }
+            let slice = deadline.saturating_duration_since(now).min(Duration::from_millis(200));
+            let _ = socket.set_read_timeout(Some(slice.max(Duration::from_millis(1))));
+            match socket.recv_from(&mut buf) {
+                Ok((n, _src)) => {
+                    // Verify the response HMAC before trusting the verdict.
+                    // A forged SafeToPromote without a valid monitoring_HMAC_KEY
+                    // signature is indistinguishable from MonitoringUnreachable
+                    // (the fail-safe default: stay passive).
+                    let inner = match auth::verify_monitoring(&buf[..n]) {
+                        Some(p) => p,
+                        None => {
+                            eprintln!("[monitoring-client] HMAC failure on corroboration response — staying passive");
+                            continue; // keep waiting until deadline
+                        }
+                    };
+                    if let Ok(CorroborationMsg::Response { request_id: rid, verdict, .. }) =
+                        serde_json::from_slice::<CorroborationMsg>(inner)
+                    {
+                        if rid == request_id {
+                            return match verdict {
+                                Verdict::SafeToPromote => CorroborationOutcome::SafeToPromote,
+                                Verdict::PeersStillUp => CorroborationOutcome::DeniedBymonitoring,
+                            };
+                        }
+                        // Mismatched/stale request_id — keep waiting until deadline.
+                    }
+                }
+                Err(_) => continue, // this recv slice's timeout elapsed; outer loop re-checks deadline
+            }
+        }
+    }
+}
